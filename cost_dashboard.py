@@ -144,6 +144,7 @@ SESSIONS_DIRS = [
     (Path.home() / ".omp" / "agent" / "sessions", "omp", "standard"),
     (Path.home() / ".claude" / "projects", "claude", "claude"),
     (Path.home() / ".codex" / "sessions", "codex", "codex"),
+    (Path.home() / ".gemini" / "tmp", "gemini-cli", "gemini"),
 ]
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 
@@ -201,31 +202,49 @@ MANUAL_PRICING = {
         "input": 1.25,
         "output": 10.00,
         "cache_read": 0.31,
+        "cache_write": 1.25,
     },
     "gemini-2.5-flash": {
         "input": 0.30,
         "output": 2.50,
         "cache_read": 0.075,
+        "cache_write": 0.30,
     },
     "gemini-2.0-flash": {
         "input": 0.10,
         "output": 0.40,
         "cache_read": 0.025,
+        "cache_write": 0.10,
+    },
+    "gemini-1.5-pro": {
+        "input": 1.25,
+        "output": 5.00,
+        "cache_read": 0.31,
+        "cache_write": 1.25,
+    },
+    "gemini-1.5-flash": {
+        "input": 0.075,
+        "output": 0.30,
+        "cache_read": 0.01875,
+        "cache_write": 0.075,
     },
     "gemini-3-flash-preview": {
         "input": 0.50,
         "output": 3.00,
-        "cache_read": 0.0,
+        "cache_read": 0.125,
+        "cache_write": 0.50,
     },
     "gemini-3-pro-preview": {
         "input": 2.00,
         "output": 12.00,
-        "cache_read": 0.0,
+        "cache_read": 0.50,
+        "cache_write": 2.00,
     },
     "gemini-3.1-pro-preview": {
         "input": 2.00,
         "output": 12.00,
-        "cache_read": 0.0,
+        "cache_read": 0.50,
+        "cache_write": 2.00,
     },
     # ── Claude (Anthropic API pricing per 1M tokens) ──────────────────────────
     # Specific version strings avoid mislabelling different-priced variants.
@@ -419,6 +438,9 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
                             cwd = data.get("payload", {}).get("cwd")
                             if cwd:
                                 return cwd
+                    elif source_type == "gemini":
+                        # For Gemini, the project name is the parent of the chats directory
+                        return project_dir.parent.name
                     else:
                         if data.get("type") == "session" and "cwd" in data:
                             return data["cwd"]
@@ -1001,18 +1023,153 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
     return stats
 
 
+def analyze_gemini_jsonl_file(filepath: Path) -> SessionStats:
+    """Analyze a Gemini CLI JSONL session file and return stats."""
+    stats: SessionStats = {
+        "messages": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "cost_total": 0.0,
+        "models": defaultdict(create_model_stats),
+        "timestamps": [],
+        "start": None,
+        "end": None,
+        "llm_time": 0.0,
+        "tool_time": 0.0,
+        "tools": defaultdict(create_tool_stats),
+        "tps_samples": [],
+        "cwd": "",
+    }
+
+    # Try to find cwd from history
+    project_name = filepath.parent.parent.name
+    history_root = Path.home() / ".gemini" / "history" / project_name / ".project_root"
+    if history_root.exists():
+        try:
+            stats["cwd"] = history_root.read_text().strip()
+        except Exception:
+            pass
+
+    last_request_ts = None
+
+    try:
+        with open(filepath, "r") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+
+                record_type = data.get("type")
+                # Gemini format uses startTime for the session meta line, and timestamp for others
+                ts_str = data.get("timestamp") or data.get("startTime")
+                ts = parse_timestamp(ts_str)
+
+                if ts:
+                    if stats["start"] is None or ts < stats["start"]:
+                        stats["start"] = ts
+                    if stats["end"] is None or ts > stats["end"]:
+                        stats["end"] = ts
+
+                if record_type == "user":
+                    if ts:
+                        last_request_ts = ts
+                
+                elif record_type == "gemini":
+                    model = data.get("model", "unknown")
+                    tokens = data.get("tokens", {})
+                    
+                    # Calculate LLM time
+                    llm_delta = 0
+                    if ts and last_request_ts:
+                        llm_delta = (ts - last_request_ts).total_seconds()
+                        if 0 < llm_delta < 300:
+                            stats["llm_time"] += llm_delta
+                        else:
+                            llm_delta = 0
+                        last_request_ts = None
+
+                    input_tok = tokens.get("input", 0)
+                    output_tok = tokens.get("output", 0)
+                    cache_read_tok = tokens.get("cached", 0)
+                    cache_write_tok = tokens.get("cacheWrite", 0)  # Check for explicit write tokens
+                    total_tok = tokens.get("total", input_tok + output_tok + cache_read_tok + cache_write_tok)
+
+                    cost = get_manual_cost(
+                        model,
+                        input_tok,
+                        output_tok,
+                        cache_read_tok,
+                        cache_write_tok,
+                    )
+
+                    stats["messages"] += 1
+                    stats["input_tokens"] += input_tok
+                    stats["output_tokens"] += output_tok
+                    stats["cache_read_tokens"] += cache_read_tok
+                    stats["cache_write_tokens"] += cache_write_tok
+                    stats["total_tokens"] += total_tok
+                    stats["cost_total"] += cost
+
+                    stats["models"][model]["messages"] += 1
+                    stats["models"][model]["tokens"] += total_tok
+                    stats["models"][model]["cost"] += cost
+                    stats["models"][model]["output_tokens"] += output_tok
+
+                    if llm_delta > 0 and output_tok > 0:
+                        stats["tps_samples"].append((output_tok, llm_delta, model))
+                        stats["models"][model]["llm_time"] += llm_delta
+
+                    if ts:
+                        stats["timestamps"].append(ts)
+
+                    # Process tool calls
+                    tool_calls = data.get("toolCalls", [])
+                    for tc in tool_calls:
+                        tool_name = tc.get("name", "unknown")
+                        # Tool execution completion timestamp
+                        tc_ts = parse_timestamp(tc.get("timestamp"))
+                        if tc_ts and ts:
+                            tool_delta = (tc_ts - ts).total_seconds()
+                            if 0 < tool_delta < 600:
+                                stats["tool_time"] += tool_delta
+                                stats["tools"][tool_name]["calls"] += 1
+                                stats["tools"][tool_name]["time"] += tool_delta
+                                if tc.get("status") == "error":
+                                    stats["tools"][tool_name]["errors"] += 1
+
+    except Exception as e:
+        print(f"Error reading Gemini session {filepath}: {e}")
+
+    return stats
+
+
 def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
     """Dispatch to the correct parser based on source type."""
     if source_type == "claude":
         return analyze_claude_jsonl_file(filepath)
     elif source_type == "codex":
         return analyze_codex_jsonl_file(filepath)
+    elif source_type == "gemini":
+        return analyze_gemini_jsonl_file(filepath)
     else:
         return analyze_jsonl_file(filepath)
 
 
 def analyze_project(project_dir: Path, agent_cmd: str, source_type: str = "standard") -> ProjectStats | None:
     """Analyze all sessions in a project directory."""
+
+    # Gemini sessions are in a 'chats' subdirectory within the project folder
+    if source_type == "gemini" and project_dir.name != "chats":
+        chats_dir = project_dir / "chats"
+        if chats_dir.exists() and chats_dir.is_dir():
+            project_dir = chats_dir
+        else:
+            return None
+
     project_stats: ProjectStats = {
         "name": get_project_path_from_jsonl(project_dir, source_type),
         "agent_cmd": agent_cmd,
@@ -1247,6 +1404,9 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
             cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         elif agent_name.startswith("codex"):
             script = Path(__file__).parent / "codex_export.py"
+            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+        elif agent_name.startswith("gemini"):
+            script = Path(__file__).parent / "gemini_export.py"
             cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         else:
             cmd = [*base_cmd, "--export", session_path, str(output_file)]
@@ -1488,12 +1648,13 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
                     _accumulate_global_stats(global_stats, project_stats)
             continue
 
-        # Standard and Claude: iterate per-project subdirectories
+        # Standard, Claude, Gemini: iterate per-project subdirectories
         for project_dir in sessions_dir.iterdir():
             if not project_dir.is_dir() or project_dir.name.startswith("."):
                 continue
 
             project_stats = analyze_project(project_dir, agent_cmd, source_type)
+
             if project_stats:
                 all_projects.append(project_stats)
                 _accumulate_global_stats(global_stats, project_stats)
@@ -2131,6 +2292,7 @@ def generate_html():
 <body>
     <div class="container">
         <h1>🤖 Agent Cost Dashboard</h1>
+        <p class="subtitle">Supporting pi, omp, claude, codex, and gemini</p>
         <p class="subtitle">Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} <span class="refresh-note">(Refresh page for updated stats)</span></p>
         
         <div class="stats-grid">
@@ -3045,7 +3207,7 @@ def main():
             socketserver.TCPServer.server_bind(self)
 
     httpd = DashboardServer((args.host, args.port), DashboardHandler)
-    print("🚀 Agent Cost Dashboard (pi, omp, claude, codex)")
+    print("🚀 Agent Cost Dashboard (pi, omp, claude, codex, gemini)")
     print(f"   Serving on: http://{args.host}:{args.port}")
     print("   Data from:")
     for sessions_dir, agent_cmd, source_type in SESSIONS_DIRS:

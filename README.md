@@ -1,6 +1,6 @@
 # Agent Cost Dashboard
 
-Web dashboard to monitor API costs for [Pi](https://github.com/mariozechner/pi-coding-agent), [Oh My Pi](https://github.com/can1357/oh-my-pi), [Claude Code](https://github.com/anthropics/claude-code), and [Codex CLI](https://github.com/openai/codex) coding agents.
+Web dashboard to monitor API costs for [Pi](https://github.com/mariozechner/pi-coding-agent), [Oh My Pi](https://github.com/can1357/oh-my-pi), [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), and [Gemini CLI](https://github.com/google-gemini/gemini-cli) coding agents.
 
 No external dependencies — pure Python stdlib.
 
@@ -89,25 +89,27 @@ The dashboard automatically reads session data from:
 | Oh My Pi | `~/.omp/agent/sessions` |
 | Claude Code | `~/.claude/projects` |
 | Codex CLI | `~/.codex/sessions` |
+| Gemini CLI | `~/.gemini/tmp` |
 
 ## CLI Utilities
 
-### claude_cost.py
+### claude_cost.py / gemini_cost.py
 
-Calculate API costs for Claude Code sessions:
+Calculate API costs for agent sessions:
 
 ```bash
 python claude_cost.py /path/to/sessions
-python claude_cost.py /path/to/session.jsonl
+python gemini_cost.py ~/.gemini/tmp/project/chats
 ```
 
-### claude_export.py / codex_export.py
+### claude_export.py / codex_export.py / gemini_export.py
 
 Export a session JSONL file to a styled HTML transcript:
 
 ```bash
 python claude_export.py input.jsonl output.html
 python codex_export.py input.jsonl output.html
+python gemini_export.py input.jsonl output.html
 ```
 
 ## Pricing
