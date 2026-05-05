@@ -14,6 +14,7 @@ import http.server
 import socketserver
 import argparse
 import shlex
+import shutil
 import sys
 from typing import TypedDict, DefaultDict
 
@@ -1250,6 +1251,14 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
             cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         else:
             cmd = [*base_cmd, "--export", session_path, str(output_file)]
+
+        # On Windows, subprocess can't find .cmd/.bat shims on PATH without
+        # shell=True. Resolve the executable to a full path via shutil.which
+        # so we can launch it directly and avoid quoting issues.
+        if cmd:
+            resolved = shutil.which(cmd[0])
+            if resolved:
+                cmd[0] = resolved
 
         result = subprocess.run(
             cmd,
