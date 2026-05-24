@@ -1,1 +1,1 @@
-python cost_dashboard.py
+uv run cost_dashboard.py

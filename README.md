@@ -10,8 +10,8 @@ No external dependencies — pure Python stdlib.
 
 ### Global Statistics
 Track total spending across all projects and sessions:
-- Total cost with breakdown by input, output, and cache tokens
-- Token usage across all models
+- Total tokens broken down by input, output, cache-read, cache-write, and reasoning counts when exposed
+- Detailed token usage across all models where source data exposes it
 - Session count and project count
 - LLM time vs tool execution time
 - Average tokens per second across all API calls
@@ -21,7 +21,7 @@ Timeline of API costs over time.
 
 ### Model Breakdown
 Costs broken down by AI model (Claude, Gemini, GPT-5, O3, O4, GLM, etc.):
-- Messages, token usage, and cost per model
+- Messages, input/output/cache-read/cache-write/reasoning token usage, and cost per model
 - Average tokens per second
 
 ![Model Stats](screenshots/model-stats.png)

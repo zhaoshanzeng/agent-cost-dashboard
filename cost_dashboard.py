@@ -14,6 +14,7 @@ import http.server
 import socketserver
 import argparse
 import shlex
+import shutil
 import sys
 from typing import TypedDict, DefaultDict
 
@@ -22,9 +23,13 @@ from typing import TypedDict, DefaultDict
 class ModelStats(TypedDict):
     messages: int
     tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    reasoning_tokens: int
     cost: float
     llm_time: float
-    output_tokens: int
 
 
 class ToolStats(TypedDict):
@@ -35,7 +40,6 @@ class ToolStats(TypedDict):
 
 class DailyStats(TypedDict):
     messages: int
-    tokens: int
     cost: float
     # Per-model cost breakdown for stacked bar chart.
     # Keys are model names, values are accumulated costs.
@@ -48,6 +52,7 @@ class SessionStats(TypedDict):
     output_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
+    reasoning_tokens: int
     total_tokens: int
     cost_total: float
     models: DefaultDict[str, ModelStats]
@@ -67,7 +72,11 @@ class ProjectStats(TypedDict):
     sessions: list["Session"]
     total_messages: int
     total_tokens: int
+    total_input_tokens: int
     total_output_tokens: int
+    total_cache_read_tokens: int
+    total_cache_write_tokens: int
+    total_reasoning_tokens: int
     total_cost: float
     total_llm_time: float
     total_tool_time: float
@@ -82,7 +91,11 @@ class ProjectStats(TypedDict):
 class GlobalStats(TypedDict):
     total_cost: float
     total_tokens: int
+    total_input_tokens: int
     total_output_tokens: int
+    total_cache_read_tokens: int
+    total_cache_write_tokens: int
+    total_reasoning_tokens: int
     total_messages: int
     total_sessions: int
     total_projects: int
@@ -105,7 +118,11 @@ class Session(TypedDict):
     agent_cmd: str
     messages: int
     tokens: int
+    input_tokens: int
     output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    reasoning_tokens: int
     cost: float
     start: datetime | None
     end: datetime | None
@@ -122,9 +139,13 @@ def create_model_stats() -> ModelStats:
     return {
         "messages": 0,
         "tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
         "cost": 0.0,
         "llm_time": 0.0,
-        "output_tokens": 0,
     }
 
 
@@ -133,7 +154,7 @@ def create_tool_stats() -> ToolStats:
 
 
 def create_daily_stats() -> DailyStats:
-    return {"messages": 0, "tokens": 0, "cost": 0.0, "models": {}}
+    return {"messages": 0, "cost": 0.0, "models": {}}
 
 
 # Session directories for different agents: (path, agent_command, source_type)
@@ -146,6 +167,7 @@ SESSIONS_DIRS = [
     (Path.home() / ".codex" / "sessions", "codex", "codex"),
 ]
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
+ASSETS_DIR = Path(__file__).parent / "assets"
 
 # Registry mapping session UUIDs to session data
 # This keeps sensitive path/command info server-side only
@@ -375,6 +397,63 @@ def format_duration(seconds):
         return f"{hours}h{mins:02d}m" if mins else f"{hours}h"
 
 
+def load_asset(name: str) -> str:
+    """Read a dashboard asset bundled with the script."""
+    return (ASSETS_DIR / name).read_text(encoding="utf-8")
+
+
+def format_full_number(value: int | float) -> str:
+    """Render a count without locale-dependent grouping."""
+    return str(int(round(value)))
+
+
+def trim_one_decimal(value: float) -> str:
+    text = f"{value:.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+
+def format_tokens(value: int | float) -> str:
+    """Compact count for high-level cards and summary columns."""
+    n = float(value or 0)
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    for size, suffix in (
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "k"),
+    ):
+        if n >= size:
+            return f"{sign}{trim_one_decimal(n / size)}{suffix}"
+    return f"{sign}{format_full_number(n)}"
+
+
+def json_for_script(data) -> str:
+    """Serialize JSON safely for embedding in a script tag."""
+    return json.dumps(data).replace("</", "<\\/")
+
+
+def render_token_summary_card(global_stats: GlobalStats) -> str:
+    """Render the global token card with separated cache read/write counts."""
+    items = [
+        ("Input", global_stats["total_input_tokens"]),
+        ("Output", global_stats["total_output_tokens"]),
+        ("Cache read", global_stats["total_cache_read_tokens"]),
+        ("Cache write", global_stats["total_cache_write_tokens"]),
+        ("Reasoning", global_stats["total_reasoning_tokens"]),
+    ]
+    rows = "".join(
+        f'<div><span>{label}</span><strong title="{format_full_number(count)}">{format_tokens(count)}</strong></div>'
+        for label, count in items
+    )
+    return f"""
+            <div class="stat-card token-card">
+                <div class="label">Total Tokens</div>
+                <div class="value">{format_tokens(global_stats["total_tokens"])}</div>
+                <div class="token-breakdown">{rows}</div>
+            </div>"""
+
+
 def calc_avg_tokens_per_sec(tps_samples):
     """Calculate average tokens/second from samples.
 
@@ -390,6 +469,226 @@ def calc_avg_tokens_per_sec(tps_samples):
         return 0.0
 
     return sum(tps_values) / len(tps_values)
+
+
+TOKEN_DETAIL_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+MODEL_STAT_FIELDS = (
+    "messages",
+    "tokens",
+    *TOKEN_DETAIL_FIELDS,
+    "cost",
+    "llm_time",
+)
+
+
+def create_session_stats() -> SessionStats:
+    """Create a zeroed stats record for one session file."""
+    return {
+        "messages": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "cost_total": 0.0,
+        "models": defaultdict(create_model_stats),
+        "timestamps": [],
+        "start": None,
+        "end": None,
+        "llm_time": 0.0,
+        "tool_time": 0.0,
+        "tools": defaultdict(create_tool_stats),
+        "tps_samples": [],
+        "cwd": "",
+    }
+
+
+def _record_timestamp(stats: SessionStats, ts: datetime | None) -> None:
+    if not ts:
+        return
+    stats["timestamps"].append(ts)
+    if stats["start"] is None or ts < stats["start"]:
+        stats["start"] = ts
+    if stats["end"] is None or ts > stats["end"]:
+        stats["end"] = ts
+
+
+def record_llm_usage(
+    stats: SessionStats,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    total_tokens: int | None = None,
+    cost: float = 0.0,
+    ts: datetime | None = None,
+    llm_delta: float = 0.0,
+) -> None:
+    """Record one LLM usage event into session and per-model stats."""
+    total = (
+        total_tokens
+        if total_tokens is not None
+        else input_tokens + output_tokens + cache_read_tokens + cache_write_tokens
+    )
+    model_name = model or "unknown"
+
+    stats["messages"] += 1
+    stats["input_tokens"] += input_tokens
+    stats["output_tokens"] += output_tokens
+    stats["cache_read_tokens"] += cache_read_tokens
+    stats["cache_write_tokens"] += cache_write_tokens
+    stats["reasoning_tokens"] += reasoning_tokens
+    stats["total_tokens"] += total
+    stats["cost_total"] += cost
+
+    mstats = stats["models"][model_name]
+    mstats["messages"] += 1
+    mstats["tokens"] += total
+    mstats["input_tokens"] += input_tokens
+    mstats["output_tokens"] += output_tokens
+    mstats["cache_read_tokens"] += cache_read_tokens
+    mstats["cache_write_tokens"] += cache_write_tokens
+    mstats["reasoning_tokens"] += reasoning_tokens
+    mstats["cost"] += cost
+
+    if llm_delta > 0 and output_tokens > 0:
+        stats["tps_samples"].append((output_tokens, llm_delta, model_name))
+        mstats["llm_time"] += llm_delta
+
+    _record_timestamp(stats, ts)
+
+
+def create_project_stats(name: str, agent_cmd: str) -> ProjectStats:
+    """Create a zeroed project aggregate."""
+    return {
+        "name": name,
+        "agent_cmd": agent_cmd,
+        "sessions": [],
+        "total_messages": 0,
+        "total_tokens": 0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_reasoning_tokens": 0,
+        "total_cost": 0.0,
+        "total_llm_time": 0.0,
+        "total_tool_time": 0.0,
+        "models": defaultdict(create_model_stats),
+        "tools": defaultdict(create_tool_stats),
+        "daily_stats": defaultdict(create_daily_stats),
+        "first_activity": None,
+        "last_activity": None,
+        "tps_samples": [],
+    }
+
+
+def build_session_record(
+    filepath: Path,
+    uid: str,
+    relative_path: str,
+    stats: SessionStats,
+    agent_cmd: str,
+    duration: float,
+    subagent_sessions: list[Session] | None = None,
+) -> Session:
+    """Build the serializable session record used by the UI and registry."""
+    return Session(
+        file=filepath.name,
+        path=str(filepath),
+        uid=uid,
+        relative_path=relative_path,
+        cwd=stats["cwd"],
+        agent_cmd=agent_cmd,
+        messages=stats["messages"],
+        tokens=stats["total_tokens"],
+        input_tokens=stats["input_tokens"],
+        output_tokens=stats["output_tokens"],
+        cache_read_tokens=stats["cache_read_tokens"],
+        cache_write_tokens=stats["cache_write_tokens"],
+        reasoning_tokens=stats["reasoning_tokens"],
+        cost=stats["cost_total"],
+        start=stats["start"],
+        end=stats["end"],
+        duration=duration,
+        llm_time=stats["llm_time"],
+        tool_time=stats["tool_time"],
+        tools=dict(stats["tools"]),
+        avg_tps=calc_avg_tokens_per_sec(stats["tps_samples"]),
+        subagent_sessions=subagent_sessions or [],
+    )
+
+
+def merge_model_stats(
+    target: DefaultDict[str, ModelStats], source: DefaultDict[str, ModelStats]
+) -> None:
+    for model, source_stats in source.items():
+        target_stats = target[model]
+        for field in MODEL_STAT_FIELDS:
+            target_stats[field] += source_stats.get(field, 0)
+
+
+def merge_tool_stats(
+    target: DefaultDict[str, ToolStats], source: DefaultDict[str, ToolStats]
+) -> None:
+    for tool_name, source_stats in source.items():
+        target_stats = target[tool_name]
+        target_stats["calls"] += source_stats["calls"]
+        target_stats["time"] += source_stats["time"]
+        target_stats["errors"] += source_stats["errors"]
+
+
+def accumulate_session_into_project(
+    project_stats: ProjectStats, stats: SessionStats
+) -> None:
+    """Add a parsed session (or subagent session) to a project aggregate."""
+    project_stats["total_messages"] += stats["messages"]
+    project_stats["total_tokens"] += stats["total_tokens"]
+    project_stats["total_input_tokens"] += stats["input_tokens"]
+    project_stats["total_output_tokens"] += stats["output_tokens"]
+    project_stats["total_cache_read_tokens"] += stats["cache_read_tokens"]
+    project_stats["total_cache_write_tokens"] += stats["cache_write_tokens"]
+    project_stats["total_reasoning_tokens"] += stats["reasoning_tokens"]
+    project_stats["total_cost"] += stats["cost_total"]
+    project_stats["total_llm_time"] += stats["llm_time"]
+    project_stats["total_tool_time"] += stats["tool_time"]
+    project_stats["tps_samples"].extend(stats["tps_samples"])
+
+    merge_model_stats(project_stats["models"], stats["models"])
+    merge_tool_stats(project_stats["tools"], stats["tools"])
+
+    n_ts = max(len(stats["timestamps"]), 1)
+    for ts in stats["timestamps"]:
+        day_key = ts.strftime("%Y-%m-%d")
+        project_stats["daily_stats"][day_key]["messages"] += 1
+        project_stats["daily_stats"][day_key]["cost"] += stats["cost_total"] / n_ts
+        for mdl, mst in stats["models"].items():
+            project_stats["daily_stats"][day_key]["models"][mdl] = (
+                project_stats["daily_stats"][day_key]["models"].get(mdl, 0.0)
+                + mst["cost"] / n_ts
+            )
+
+    if stats["start"]:
+        if (
+            project_stats["first_activity"] is None
+            or stats["start"] < project_stats["first_activity"]
+        ):
+            project_stats["first_activity"] = stats["start"]
+    if stats["end"]:
+        if (
+            project_stats["last_activity"] is None
+            or stats["end"] > project_stats["last_activity"]
+        ):
+            project_stats["last_activity"] = stats["end"]
 
 
 def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
@@ -430,24 +729,7 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
 
 def analyze_jsonl_file(filepath: Path) -> SessionStats:
     """Analyze a single JSONL file and return stats."""
-    stats: SessionStats = {
-        "messages": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "total_tokens": 0,
-        "cost_total": 0.0,
-        "models": defaultdict(create_model_stats),
-        "timestamps": [],
-        "start": None,
-        "end": None,
-        "llm_time": 0.0,  # Total LLM working time in seconds
-        "tool_time": 0.0,  # Total tool execution time in seconds
-        "tools": defaultdict(create_tool_stats),  # Per-tool stats
-        "tps_samples": [],  # List of (output_tokens, llm_seconds) per call for tokens/sec calculation
-        "cwd": "",
-    }
+    stats = create_session_stats()
 
     last_request_ts = None  # Timestamp of last user message or toolResult
     pending_tool_calls = {}  # tool_call_id -> {"name": str, "timestamp": datetime}
@@ -498,7 +780,12 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
                             output_tok = usage.get("output", 0)
                             cache_read_tok = usage.get("cacheRead", 0)
                             cache_write_tok = usage.get("cacheWrite", 0)
-                            total_tok = usage.get("totalTokens", 0)
+                            total_tok = usage.get("totalTokens") or (
+                                input_tok
+                                + output_tok
+                                + cache_read_tok
+                                + cache_write_tok
+                            )
                             reported_cost = cost.get("total", 0)
 
                             if reported_cost == 0:
@@ -510,32 +797,18 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
                                     cache_write_tok,
                                 )
 
-                            stats["messages"] += 1
-                            stats["input_tokens"] += input_tok
-                            stats["output_tokens"] += output_tok
-                            stats["cache_read_tokens"] += cache_read_tok
-                            stats["cache_write_tokens"] += cache_write_tok
-                            stats["total_tokens"] += total_tok
-                            stats["cost_total"] += reported_cost
-
-                            stats["models"][model]["messages"] += 1
-                            stats["models"][model]["tokens"] += total_tok
-                            stats["models"][model]["cost"] += reported_cost
-                            stats["models"][model]["output_tokens"] += output_tok
-
-                            # Track tokens/second sample if we have valid timing
-                            if llm_delta > 0 and output_tok > 0:
-                                stats["tps_samples"].append(
-                                    (output_tok, llm_delta, model)
-                                )
-                                stats["models"][model]["llm_time"] += llm_delta
-
-                            if ts:
-                                stats["timestamps"].append(ts)
-                                if stats["start"] is None or ts < stats["start"]:
-                                    stats["start"] = ts
-                                if stats["end"] is None or ts > stats["end"]:
-                                    stats["end"] = ts
+                            record_llm_usage(
+                                stats,
+                                model,
+                                input_tok,
+                                output_tok,
+                                cache_read_tok,
+                                cache_write_tok,
+                                total_tokens=total_tok,
+                                cost=reported_cost,
+                                ts=ts,
+                                llm_delta=llm_delta,
+                            )
 
                         # Track tool calls from assistant messages
                         if ts:
@@ -597,24 +870,7 @@ def analyze_claude_jsonl_file(filepath: Path) -> SessionStats:
     Usage is in message.usage with input_tokens, output_tokens, cache_read_input_tokens,
     cache_creation_input_tokens. No embedded cost - compute via get_manual_cost().
     """
-    stats: SessionStats = {
-        "messages": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "total_tokens": 0,
-        "cost_total": 0.0,
-        "models": defaultdict(create_model_stats),
-        "timestamps": [],
-        "start": None,
-        "end": None,
-        "llm_time": 0.0,
-        "tool_time": 0.0,
-        "tools": defaultdict(create_tool_stats),
-        "tps_samples": [],
-        "cwd": "",
-    }
+    stats = create_session_stats()
 
     last_request_ts = None
     pending_tool_calls = {}  # tool_use id -> {"name": str, "timestamp": datetime}
@@ -710,31 +966,18 @@ def analyze_claude_jsonl_file(filepath: Path) -> SessionStats:
                             cache_write_tok,
                         )
 
-                        stats["messages"] += 1
-                        stats["input_tokens"] += input_tok
-                        stats["output_tokens"] += output_tok
-                        stats["cache_read_tokens"] += cache_read_tok
-                        stats["cache_write_tokens"] += cache_write_tok
-                        stats["total_tokens"] += total_tok
-                        stats["cost_total"] += cost
-
-                        stats["models"][model]["messages"] += 1
-                        stats["models"][model]["tokens"] += total_tok
-                        stats["models"][model]["cost"] += cost
-                        stats["models"][model]["output_tokens"] += output_tok
-
-                        if llm_delta > 0 and output_tok > 0:
-                            stats["tps_samples"].append(
-                                (output_tok, llm_delta, model)
-                            )
-                            stats["models"][model]["llm_time"] += llm_delta
-
-                        if ts:
-                            stats["timestamps"].append(ts)
-                            if stats["start"] is None or ts < stats["start"]:
-                                stats["start"] = ts
-                            if stats["end"] is None or ts > stats["end"]:
-                                stats["end"] = ts
+                        record_llm_usage(
+                            stats,
+                            model,
+                            input_tok,
+                            output_tok,
+                            cache_read_tok,
+                            cache_write_tok,
+                            total_tokens=total_tok,
+                            cost=cost,
+                            ts=ts,
+                            llm_delta=llm_delta,
+                        )
 
                     # Track tool_use calls from assistant content
                     content = msg.get("content", [])
@@ -787,14 +1030,14 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
         cache_read = to_nonneg_int(usage_obj.get("cached_input_tokens", 0))
         output = to_nonneg_int(usage_obj.get("output_tokens", 0))
         reasoning = to_nonneg_int(usage_obj.get("reasoning_output_tokens", 0))
+        reported_total = to_nonneg_int(usage_obj.get("total_tokens", 0))
 
         # Codex input_tokens includes cached_input_tokens. Store net input to avoid
         # double counting input + cache read in totals and manual pricing.
         input_net = max(0, raw_input - cache_read)
 
-        # Match ccusage semantics: billable total excludes reasoning breakdown
-        # and avoids relying on provider-specific total_tokens behavior.
-        total = input_net + output + cache_read
+        computed_total = input_net + output + cache_read
+        total = reported_total or computed_total
 
         return {
             "input_tokens": input_net,
@@ -835,24 +1078,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
             "total_tokens": left["total_tokens"] + right["total_tokens"],
         }
 
-    stats: SessionStats = {
-        "messages": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "total_tokens": 0,
-        "cost_total": 0.0,
-        "models": defaultdict(create_model_stats),
-        "timestamps": [],
-        "start": None,
-        "end": None,
-        "llm_time": 0.0,
-        "tool_time": 0.0,
-        "tools": defaultdict(create_tool_stats),
-        "tps_samples": [],
-        "cwd": "",
-    }
+    stats = create_session_stats()
 
     cwd = ""
     model = ""
@@ -934,27 +1160,17 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                         model, input_tok, output_tok, cache_read_tok
                     )
 
-                    stats["messages"] += 1
-                    stats["input_tokens"] += input_tok
-                    stats["output_tokens"] += output_tok + reasoning_tok
-                    stats["cache_read_tokens"] += cache_read_tok
-                    stats["total_tokens"] += total_tok
-                    stats["cost_total"] += cost
-
-                    current_model = model or "unknown"
-                    stats["models"][current_model]["messages"] += 1
-                    stats["models"][current_model]["tokens"] += total_tok
-                    stats["models"][current_model]["cost"] += cost
-                    stats["models"][current_model]["output_tokens"] += (
-                        output_tok + reasoning_tok
+                    record_llm_usage(
+                        stats,
+                        model,
+                        input_tok,
+                        output_tok,
+                        cache_read_tok,
+                        reasoning_tokens=reasoning_tok,
+                        total_tokens=total_tok,
+                        cost=cost,
+                        ts=ts,
                     )
-
-                    if ts:
-                        stats["timestamps"].append(ts)
-                        if stats["start"] is None or ts < stats["start"]:
-                            stats["start"] = ts
-                        if stats["end"] is None or ts > stats["end"]:
-                            stats["end"] = ts
 
                     if latest_total_usage:
                         previous_total_usage = latest_total_usage
@@ -1011,25 +1227,13 @@ def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
         return analyze_jsonl_file(filepath)
 
 
-def analyze_project(project_dir: Path, agent_cmd: str, source_type: str = "standard") -> ProjectStats | None:
+def analyze_project(
+    project_dir: Path, agent_cmd: str, source_type: str = "standard"
+) -> ProjectStats | None:
     """Analyze all sessions in a project directory."""
-    project_stats: ProjectStats = {
-        "name": get_project_path_from_jsonl(project_dir, source_type),
-        "agent_cmd": agent_cmd,
-        "sessions": [],
-        "total_messages": 0,
-        "total_tokens": 0,
-        "total_output_tokens": 0,
-        "total_cost": 0.0,
-        "total_llm_time": 0.0,
-        "total_tool_time": 0.0,
-        "models": defaultdict(create_model_stats),
-        "tools": defaultdict(create_tool_stats),
-        "daily_stats": defaultdict(create_daily_stats),
-        "first_activity": None,
-        "last_activity": None,
-        "tps_samples": [],  # Aggregated tokens/sec samples
-    }
+    project_stats = create_project_stats(
+        get_project_path_from_jsonl(project_dir, source_type), agent_cmd
+    )
 
     # Only get top-level JSONL files (not in subdirectories)
     jsonl_files = list(project_dir.glob("*.jsonl"))
@@ -1073,153 +1277,94 @@ def analyze_project(project_dir: Path, agent_cmd: str, source_type: str = "stand
                         str(sub_jsonl), source_type
                     ) or str(uuid.uuid4())
 
-                    sub_session = Session(
-                        file=sub_jsonl.name,
-                        path=str(sub_jsonl),
-                        uid=sub_uid,
-                        relative_path=str(sub_relative),
-                        cwd=sub_stats["cwd"],
-                        agent_cmd=agent_cmd,
-                        messages=sub_stats["messages"],
-                        tokens=sub_stats["total_tokens"],
-                        output_tokens=sub_stats["output_tokens"],
-                        cost=sub_stats["cost_total"],
-                        start=sub_stats["start"],
-                        end=sub_stats["end"],
-                        duration=sub_duration,
-                        llm_time=sub_stats["llm_time"],
-                        tool_time=sub_stats["tool_time"],
-                        tools=dict(sub_stats["tools"]),
-                        avg_tps=calc_avg_tokens_per_sec(sub_stats["tps_samples"]),
-                        subagent_sessions=[],
+                    sub_session = build_session_record(
+                        sub_jsonl,
+                        sub_uid,
+                        str(sub_relative),
+                        sub_stats,
+                        agent_cmd,
+                        sub_duration,
                     )
                     SESSION_REGISTRY[sub_uid] = sub_session
                     subagent_sessions.append(sub_session)
-
-                    # Include subagent stats in project totals
-                    project_stats["total_messages"] += sub_stats["messages"]
-                    project_stats["total_tokens"] += sub_stats["total_tokens"]
-                    project_stats["total_output_tokens"] += sub_stats["output_tokens"]
-                    project_stats["total_cost"] += sub_stats["cost_total"]
-                    project_stats["total_llm_time"] += sub_stats["llm_time"]
-                    project_stats["total_tool_time"] += sub_stats["tool_time"]
-                    project_stats["tps_samples"].extend(sub_stats["tps_samples"])
-
-                    # Track subagent model usage
-                    for model, mstats in sub_stats["models"].items():
-                        project_stats["models"][model]["messages"] += mstats["messages"]
-                        project_stats["models"][model]["tokens"] += mstats["tokens"]
-                        project_stats["models"][model]["cost"] += mstats["cost"]
-                        project_stats["models"][model]["llm_time"] += mstats.get(
-                            "llm_time", 0
-                        )
-                        project_stats["models"][model]["output_tokens"] += mstats.get(
-                            "output_tokens", 0
-                        )
-
-                    # Track subagent tool usage
-                    for tool_name, tstats in sub_stats["tools"].items():
-                        project_stats["tools"][tool_name]["calls"] += tstats["calls"]
-                        project_stats["tools"][tool_name]["time"] += tstats["time"]
-                        project_stats["tools"][tool_name]["errors"] += tstats["errors"]
-
-                    # Track subagent daily stats
-                    n_ts = max(len(sub_stats["timestamps"]), 1)
-                    for ts in sub_stats["timestamps"]:
-                        day_key = ts.strftime("%Y-%m-%d")
-                        project_stats["daily_stats"][day_key]["messages"] += 1
-                        project_stats["daily_stats"][day_key]["cost"] += (
-                            sub_stats["cost_total"] / n_ts
-                        )
-                        for mdl, mst in sub_stats["models"].items():
-                            project_stats["daily_stats"][day_key]["models"][
-                                mdl
-                            ] = project_stats["daily_stats"][day_key][
-                                "models"
-                            ].get(
-                                mdl, 0.0
-                            ) + mst[
-                                "cost"
-                            ] / n_ts
+                    accumulate_session_into_project(project_stats, sub_stats)
 
         # Get UID from file or generate random one
         session_uid = get_session_id_from_file(str(filepath), source_type) or str(
             uuid.uuid4()
         )
 
-        session = Session(
-            file=filepath.name,
-            path=str(filepath),
-            uid=session_uid,
-            relative_path=filepath.name,  # Top-level, just the filename
-            cwd=stats["cwd"],
-            agent_cmd=agent_cmd,
-            messages=stats["messages"],
-            tokens=stats["total_tokens"],
-            output_tokens=stats["output_tokens"],
-            cost=stats["cost_total"],
-            start=stats["start"],
-            end=stats["end"],
-            duration=duration,
-            llm_time=stats["llm_time"],
-            tool_time=stats["tool_time"],
-            tools=dict(stats["tools"]),
-            avg_tps=calc_avg_tokens_per_sec(stats["tps_samples"]),
-            subagent_sessions=subagent_sessions,
+        session = build_session_record(
+            filepath,
+            session_uid,
+            filepath.name,
+            stats,
+            agent_cmd,
+            duration,
+            subagent_sessions,
         )
         SESSION_REGISTRY[session_uid] = session
         project_stats["sessions"].append(session)
-
-        project_stats["total_messages"] += stats["messages"]
-        project_stats["total_tokens"] += stats["total_tokens"]
-        project_stats["total_output_tokens"] += stats["output_tokens"]
-        project_stats["total_cost"] += stats["cost_total"]
-        project_stats["total_llm_time"] += stats["llm_time"]
-        project_stats["total_tool_time"] += stats["tool_time"]
-        project_stats["tps_samples"].extend(stats["tps_samples"])
-
-        for model, mstats in stats["models"].items():
-            project_stats["models"][model]["messages"] += mstats["messages"]
-            project_stats["models"][model]["tokens"] += mstats["tokens"]
-            project_stats["models"][model]["cost"] += mstats["cost"]
-            project_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
-            project_stats["models"][model]["output_tokens"] += mstats.get(
-                "output_tokens", 0
-            )
-
-        for tool_name, tstats in stats["tools"].items():
-            project_stats["tools"][tool_name]["calls"] += tstats["calls"]
-            project_stats["tools"][tool_name]["time"] += tstats["time"]
-            project_stats["tools"][tool_name]["errors"] += tstats["errors"]
-
-        n_ts = max(len(stats["timestamps"]), 1)
-        for ts in stats["timestamps"]:
-            day_key = ts.strftime("%Y-%m-%d")
-            project_stats["daily_stats"][day_key]["messages"] += 1
-            project_stats["daily_stats"][day_key]["cost"] += (
-                stats["cost_total"] / n_ts
-            )
-            for mdl, mst in stats["models"].items():
-                project_stats["daily_stats"][day_key]["models"][
-                    mdl
-                ] = project_stats["daily_stats"][day_key]["models"].get(
-                    mdl, 0.0
-                ) + mst["cost"] / n_ts
-
-        if stats["start"]:
-            if (
-                project_stats["first_activity"] is None
-                or stats["start"] < project_stats["first_activity"]
-            ):
-                project_stats["first_activity"] = stats["start"]
-        if stats["end"]:
-            if (
-                project_stats["last_activity"] is None
-                or stats["end"] > project_stats["last_activity"]
-            ):
-                project_stats["last_activity"] = stats["end"]
+        accumulate_session_into_project(project_stats, stats)
 
     return project_stats if project_stats["sessions"] else None
+
+
+def split_agent_command(agent_cmd: str) -> list[str]:
+    """Split an agent command while respecting platform quoting rules."""
+    try:
+        parts = shlex.split(agent_cmd, posix=sys.platform != "win32")
+    except ValueError:
+        parts = agent_cmd.split()
+
+    if sys.platform == "win32":
+        parts = [part.strip('"') for part in parts]
+
+    return parts
+
+
+def resolve_command_executable(cmd: list[str]) -> list[str]:
+    """Resolve console shims like pi.cmd on Windows before subprocess runs."""
+    if not cmd:
+        return cmd
+
+    resolved = shutil.which(cmd[0])
+    if not resolved and sys.platform == "win32" and not Path(cmd[0]).suffix:
+        for ext in (".cmd", ".bat", ".exe"):
+            resolved = shutil.which(cmd[0] + ext)
+            if resolved:
+                break
+
+    return [resolved or cmd[0], *cmd[1:]]
+
+
+def run_export_subprocess(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run an export command, handling Windows .cmd/.bat shims correctly."""
+    run_kwargs = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+    }
+
+    if sys.platform == "win32" and cmd:
+        suffix = Path(cmd[0]).suffix.lower()
+        if suffix in {".cmd", ".bat"}:
+            return subprocess.run(
+                subprocess.list2cmdline(cmd),
+                shell=True,
+                **run_kwargs,
+            )
+
+    try:
+        return subprocess.run(cmd, **run_kwargs)
+    except FileNotFoundError:
+        if sys.platform == "win32":
+            return subprocess.run(
+                subprocess.list2cmdline(cmd),
+                shell=True,
+                **run_kwargs,
+            )
+        raise
 
 
 def export_session_to_html(session_path: str, agent_cmd: str) -> str:
@@ -1235,10 +1380,8 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
     output_file = TEMP_DIR / f"session_{session_hash}.html"
 
     try:
-        try:
-            base_cmd = shlex.split(agent_cmd)
-        except ValueError:
-            base_cmd = agent_cmd.split()
+        base_cmd = split_agent_command(agent_cmd)
+        base_cmd = resolve_command_executable(base_cmd)
 
         agent_name = Path(base_cmd[0]).name.lower() if base_cmd else ""
 
@@ -1251,14 +1394,9 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
         else:
             cmd = [*base_cmd, "--export", session_path, str(output_file)]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        result = run_export_subprocess(cmd)
         if result.returncode == 0 and output_file.exists():
-            return output_file.read_text()
+            return output_file.read_text(encoding="utf-8")
     except Exception as e:
         return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(str(e))}</pre></body></html>"
 
@@ -1296,23 +1434,7 @@ def _build_codex_project_stats(
     project_cwd: str, files: list[Path], agent_cmd: str
 ) -> ProjectStats | None:
     """Build a ProjectStats from a list of Codex session files grouped by cwd."""
-    project_stats: ProjectStats = {
-        "name": project_cwd,
-        "agent_cmd": agent_cmd,
-        "sessions": [],
-        "total_messages": 0,
-        "total_tokens": 0,
-        "total_output_tokens": 0,
-        "total_cost": 0.0,
-        "total_llm_time": 0.0,
-        "total_tool_time": 0.0,
-        "models": defaultdict(create_model_stats),
-        "tools": defaultdict(create_tool_stats),
-        "daily_stats": defaultdict(create_daily_stats),
-        "first_activity": None,
-        "last_activity": None,
-        "tps_samples": [],
-    }
+    project_stats = create_project_stats(project_cwd, agent_cmd)
 
     for filepath in sorted(files):
         stats = analyze_codex_jsonl_file(filepath)
@@ -1329,77 +1451,17 @@ def _build_codex_project_stats(
             uuid.uuid4()
         )
 
-        session = Session(
-            file=filepath.name,
-            path=str(filepath),
-            uid=session_uid,
-            relative_path=filepath.name,
-            cwd=stats["cwd"],
-            agent_cmd=agent_cmd,
-            messages=stats["messages"],
-            tokens=stats["total_tokens"],
-            output_tokens=stats["output_tokens"],
-            cost=stats["cost_total"],
-            start=stats["start"],
-            end=stats["end"],
-            duration=duration,
-            llm_time=stats["llm_time"],
-            tool_time=stats["tool_time"],
-            tools=dict(stats["tools"]),
-            avg_tps=calc_avg_tokens_per_sec(stats["tps_samples"]),
-            subagent_sessions=[],
+        session = build_session_record(
+            filepath,
+            session_uid,
+            filepath.name,
+            stats,
+            agent_cmd,
+            duration,
         )
         SESSION_REGISTRY[session_uid] = session
         project_stats["sessions"].append(session)
-
-        project_stats["total_messages"] += stats["messages"]
-        project_stats["total_tokens"] += stats["total_tokens"]
-        project_stats["total_output_tokens"] += stats["output_tokens"]
-        project_stats["total_cost"] += stats["cost_total"]
-        project_stats["total_llm_time"] += stats["llm_time"]
-        project_stats["total_tool_time"] += stats["tool_time"]
-        project_stats["tps_samples"].extend(stats["tps_samples"])
-
-        for model, mstats in stats["models"].items():
-            project_stats["models"][model]["messages"] += mstats["messages"]
-            project_stats["models"][model]["tokens"] += mstats["tokens"]
-            project_stats["models"][model]["cost"] += mstats["cost"]
-            project_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
-            project_stats["models"][model]["output_tokens"] += mstats.get(
-                "output_tokens", 0
-            )
-
-        for tool_name, tstats in stats["tools"].items():
-            project_stats["tools"][tool_name]["calls"] += tstats["calls"]
-            project_stats["tools"][tool_name]["time"] += tstats["time"]
-            project_stats["tools"][tool_name]["errors"] += tstats["errors"]
-
-        n_ts = max(len(stats["timestamps"]), 1)
-        for ts in stats["timestamps"]:
-            day_key = ts.strftime("%Y-%m-%d")
-            project_stats["daily_stats"][day_key]["messages"] += 1
-            project_stats["daily_stats"][day_key]["cost"] += (
-                stats["cost_total"] / n_ts
-            )
-            for mdl, mst in stats["models"].items():
-                project_stats["daily_stats"][day_key]["models"][
-                    mdl
-                ] = project_stats["daily_stats"][day_key]["models"].get(
-                    mdl, 0.0
-                ) + mst["cost"] / n_ts
-
-        if stats["start"]:
-            if (
-                project_stats["first_activity"] is None
-                or stats["start"] < project_stats["first_activity"]
-            ):
-                project_stats["first_activity"] = stats["start"]
-        if stats["end"]:
-            if (
-                project_stats["last_activity"] is None
-                or stats["end"] > project_stats["last_activity"]
-            ):
-                project_stats["last_activity"] = stats["end"]
+        accumulate_session_into_project(project_stats, stats)
 
     return project_stats if project_stats["sessions"] else None
 
@@ -1410,7 +1472,11 @@ def _accumulate_global_stats(
     """Accumulate project stats into global stats."""
     global_stats["total_cost"] += project_stats["total_cost"]
     global_stats["total_tokens"] += project_stats["total_tokens"]
+    global_stats["total_input_tokens"] += project_stats["total_input_tokens"]
     global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
+    global_stats["total_cache_read_tokens"] += project_stats["total_cache_read_tokens"]
+    global_stats["total_cache_write_tokens"] += project_stats["total_cache_write_tokens"]
+    global_stats["total_reasoning_tokens"] += project_stats["total_reasoning_tokens"]
     global_stats["total_messages"] += project_stats["total_messages"]
     global_stats["total_sessions"] += len(project_stats["sessions"])
     global_stats["total_projects"] += 1
@@ -1418,19 +1484,8 @@ def _accumulate_global_stats(
     global_stats["total_tool_time"] += project_stats["total_tool_time"]
     global_stats["tps_samples"].extend(project_stats["tps_samples"])
 
-    for model, mstats in project_stats["models"].items():
-        global_stats["models"][model]["messages"] += mstats["messages"]
-        global_stats["models"][model]["tokens"] += mstats["tokens"]
-        global_stats["models"][model]["cost"] += mstats["cost"]
-        global_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
-        global_stats["models"][model]["output_tokens"] += mstats.get(
-            "output_tokens", 0
-        )
-
-    for tool_name, tstats in project_stats["tools"].items():
-        global_stats["tools"][tool_name]["calls"] += tstats["calls"]
-        global_stats["tools"][tool_name]["time"] += tstats["time"]
-        global_stats["tools"][tool_name]["errors"] += tstats["errors"]
+    merge_model_stats(global_stats["models"], project_stats["models"])
+    merge_tool_stats(global_stats["tools"], project_stats["tools"])
 
     for day, dstats in project_stats["daily_stats"].items():
         global_stats["daily_stats"][day]["messages"] += dstats["messages"]
@@ -1452,7 +1507,11 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
     global_stats: GlobalStats = {
         "total_cost": 0.0,
         "total_tokens": 0,
+        "total_input_tokens": 0,
         "total_output_tokens": 0,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_reasoning_tokens": 0,
         "total_messages": 0,
         "total_sessions": 0,
         "total_projects": 0,
@@ -1534,6 +1593,11 @@ def generate_html():
                         "cwd": sub["cwd"],
                         "messages": sub["messages"],
                         "tokens": sub["tokens"],
+                        "input_tokens": sub["input_tokens"],
+                        "output_tokens": sub["output_tokens"],
+                        "cache_read_tokens": sub["cache_read_tokens"],
+                        "cache_write_tokens": sub["cache_write_tokens"],
+                        "reasoning_tokens": sub["reasoning_tokens"],
                         "cost": sub["cost"],
                         "start": sub["start"].isoformat() if sub["start"] else "",
                         "start_display": sub["start"].strftime("%Y-%m-%d %H:%M")
@@ -1561,6 +1625,11 @@ def generate_html():
                     "cwd": s["cwd"],
                     "messages": s["messages"],
                     "tokens": s["tokens"],
+                    "input_tokens": s["input_tokens"],
+                    "output_tokens": s["output_tokens"],
+                    "cache_read_tokens": s["cache_read_tokens"],
+                    "cache_write_tokens": s["cache_write_tokens"],
+                    "reasoning_tokens": s["reasoning_tokens"],
                     "cost": s["cost"],
                     "start": s["start"].isoformat() if s["start"] else "",
                     "start_display": s["start"].strftime("%Y-%m-%d %H:%M")
@@ -1592,6 +1661,11 @@ def generate_html():
                     "name": model_name,
                     "messages": mstats["messages"],
                     "tokens": mstats["tokens"],
+                    "input_tokens": mstats["input_tokens"],
+                    "output_tokens": mstats["output_tokens"],
+                    "cache_read_tokens": mstats["cache_read_tokens"],
+                    "cache_write_tokens": mstats["cache_write_tokens"],
+                    "reasoning_tokens": mstats["reasoning_tokens"],
                     "cost": mstats["cost"],
                     "avg_tps": model_tps,
                 }
@@ -1629,6 +1703,11 @@ def generate_html():
                 "sessions_list": sessions_json,
                 "messages": p["total_messages"],
                 "tokens": p["total_tokens"],
+                "input_tokens": p["total_input_tokens"],
+                "output_tokens": p["total_output_tokens"],
+                "cache_read_tokens": p["total_cache_read_tokens"],
+                "cache_write_tokens": p["total_cache_write_tokens"],
+                "reasoning_tokens": p["total_reasoning_tokens"],
                 "cost": p["total_cost"],
                 "llm_time": p["total_llm_time"],
                 "llm_time_display": format_duration(p["total_llm_time"]),
@@ -1646,6 +1725,26 @@ def generate_html():
             }
         )
 
+    # Build daily stats JSON for client-side chart rendering.
+    # Each entry: {day, cost, models: {modelName: cost}}
+    daily_stats_list = []
+    for day in sorted(global_stats["daily_stats"].keys()):
+        day_data = global_stats["daily_stats"][day]
+        daily_stats_list.append(
+            {
+                "day": day,
+                "cost": day_data["cost"],
+                "models": day_data.get("models", {}),
+            }
+        )
+
+    dashboard_css = load_asset("dashboard.css")
+    dashboard_js = load_asset("dashboard.js")
+    dashboard_data_json = json_for_script(
+        {"projects": projects_json, "dailyStats": daily_stats_list}
+    )
+    token_summary_card = render_token_summary_card(global_stats)
+
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1653,486 +1752,14 @@ def generate_html():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agent Cost Dashboard</title>
     <style>
-        :root {{
-            --bg-primary: #0d1117;
-            --bg-secondary: #161b22;
-            --bg-tertiary: #21262d;
-            --border-color: #30363d;
-            --text-primary: #e6edf3;
-            --text-secondary: #8b949e;
-            --accent-blue: #58a6ff;
-            --accent-green: #3fb950;
-            --accent-yellow: #d29922;
-            --accent-red: #f85149;
-            --accent-purple: #a371f7;
-        }}
-        
-        * {{
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }}
-        
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            line-height: 1.5;
-            padding: 20px;
-        }}
-        
-        .container {{
-            max-width: 1400px;
-            margin: 0 auto;
-        }}
-        
-        h1 {{
-            font-size: 28px;
-            margin-bottom: 8px;
-        }}
-        
-        .subtitle {{
-            color: var(--text-secondary);
-            margin-bottom: 24px;
-        }}
-        
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin-bottom: 32px;
-        }}
-        
-        .stat-card {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 16px;
-        }}
-        
-        .stat-card .label {{
-            color: var(--text-secondary);
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }}
-        
-        .stat-card .value {{
-            font-size: 28px;
-            font-weight: 600;
-            margin-top: 4px;
-        }}
-        
-        .stat-card .value.cost {{
-            color: var(--accent-green);
-        }}
-        
-        .section {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            margin-bottom: 24px;
-            overflow: hidden;
-        }}
-        
-        .section-header {{
-            padding: 16px;
-            border-bottom: 1px solid var(--border-color);
-            font-weight: 600;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }}
-        
-        .section-header .badge {{
-            background: var(--bg-tertiary);
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            color: var(--text-secondary);
-        }}
-        
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-        }}
-        
-        th, td {{
-            padding: 12px 16px;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }}
-        
-        th {{
-            background: var(--bg-tertiary);
-            font-weight: 600;
-            font-size: 12px;
-            text-transform: uppercase;
-            color: var(--text-secondary);
-            cursor: pointer;
-            user-select: none;
-            white-space: nowrap;
-        }}
-        
-        th:hover {{
-            color: var(--text-primary);
-        }}
-        
-        th .sort-icon {{
-            margin-left: 4px;
-            opacity: 0.3;
-        }}
-        
-        th.sorted .sort-icon {{
-            opacity: 1;
-        }}
-        
-        tr:hover {{
-            background: var(--bg-tertiary);
-        }}
-        
-        .project-name {{
-            font-family: monospace;
-            color: var(--accent-blue);
-        }}
-        
-        .cost {{
-            color: var(--accent-green);
-            font-weight: 500;
-        }}
-        
-        .tokens {{
-            color: var(--text-secondary);
-        }}
-        
-        .model-tag {{
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            margin-right: 4px;
-            margin-bottom: 4px;
-        }}
-        
-        .model-claude {{
-            background: rgba(167, 113, 247, 0.2);
-            color: var(--accent-purple);
-        }}
-        
-        .model-other {{
-            background: rgba(88, 166, 255, 0.2);
-            color: var(--accent-blue);
-        }}
-        
-        .bar-container {{
-            width: 100%;
-            height: 8px;
-            background: var(--bg-tertiary);
-            border-radius: 4px;
-            overflow: hidden;
-        }}
-        
-        /* Stacked bar: child segments sit side-by-side via flex */
-        .bar-container.stacked {{
-            display: flex;
-            flex-direction: row;
-            background: var(--bg-tertiary);
-        }}
-        
-        .bar-segment {{
-            height: 8px;
-            flex-shrink: 0;
-        }}
-        
-        .bar {{
-            height: 100%;
-            background: var(--accent-green);
-            border-radius: 4px;
-        }}
-        
-        .daily-chart {{
-            padding: 16px;
-        }}
-        
-        /* Legend strip above the daily bars */
-        .daily-legend {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin-bottom: 14px;
-            font-size: 12px;
-            color: var(--text-secondary);
-        }}
-        
-        .legend-item {{
-            display: flex;
-            align-items: center;
-            gap: 5px;
-        }}
-        
-        .legend-dot {{
-            display: inline-block;
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            flex-shrink: 0;
-        }}
-        
-        .daily-bar {{
-            display: flex;
-            align-items: center;
-            margin-bottom: 8px;
-        }}
-        
-        .daily-bar .date {{
-            width: 130px;
-            font-size: 13px;
-            color: var(--text-secondary);
-            flex-shrink: 0;
-        }}
-        
-        .daily-bar .bar-wrapper {{
-            flex: 1;
-            margin: 0 12px;
-        }}
-        
-        .daily-bar .amount {{
-            width: 80px;
-            text-align: right;
-            font-size: 13px;
-            color: var(--accent-green);
-            flex-shrink: 0;
-        }}
-        
-        /* Monthly total summary row */
-        .monthly-total-row {{
-            display: flex;
-            align-items: center;
-            margin-bottom: 14px;
-            margin-top: 4px;
-            padding: 6px 0;
-            border-top: 1px solid var(--border-color);
-            border-bottom: 1px solid var(--border-color);
-        }}
-        
-        .monthly-total-row .date {{
-            width: 130px;
-            flex-shrink: 0;
-        }}
-        
-        .monthly-total-row .bar-wrapper {{
-            flex: 1;
-            margin: 0 12px;
-        }}
-        
-        .monthly-label {{
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }}
-        
-        .monthly-amount {{
-            width: 80px;
-            text-align: right;
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--accent-green);
-            flex-shrink: 0;
-        }}
-        
-        .refresh-note {{
-            color: var(--text-secondary);
-            font-size: 12px;
-        }}
-        
-        .session-link {{
-            color: var(--accent-blue);
-            text-decoration: none;
-            cursor: pointer;
-        }}
-        
-        .session-link:hover {{
-            text-decoration: underline;
-        }}
-        
-        .expand-btn {{
-            background: none;
-            border: none;
-            color: var(--text-secondary);
-            cursor: pointer;
-            padding: 4px 8px;
-            font-size: 12px;
-        }}
-        
-        .expand-btn:hover {{
-            color: var(--text-primary);
-        }}
-        
-        .sessions-dropdown {{
-            display: none;
-            background: var(--bg-tertiary);
-            padding: 8px 16px;
-            margin-top: 4px;
-            border-radius: 4px;
-        }}
-        
-        .sessions-dropdown.show {{
-            display: block;
-        }}
-        
-        .session-item {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 6px 0;
-            border-bottom: 1px solid var(--border-color);
-            font-size: 13px;
-        }}
-        
-        .session-item:last-child {{
-            border-bottom: none;
-        }}
-        
-        .session-info {{
-            display: flex;
-            gap: 16px;
-            color: var(--text-secondary);
-        }}
-        
-        .back-link {{
-            color: var(--accent-blue);
-            text-decoration: none;
-            margin-bottom: 16px;
-            display: inline-block;
-        }}
-        
-        .back-link:hover {{
-            text-decoration: underline;
-        }}
-        
-        .expandable-row {{
-            cursor: pointer;
-        }}
-        
-        .expandable-row:hover {{
-            background: var(--bg-tertiary);
-        }}
-        
-        .expand-icon {{
-            display: inline-block;
-            width: 16px;
-            color: var(--text-secondary);
-            transition: transform 0.2s;
-        }}
-        
-        .expandable-row.expanded .expand-icon {{
-            transform: rotate(90deg);
-        }}
-        
-        .model-breakdown {{
-            display: none;
-        }}
-        
-        .model-breakdown.show {{
-            display: table-row;
-        }}
-        
-        .model-breakdown td {{
-            padding: 0;
-            background: var(--bg-tertiary);
-        }}
-        
-        .model-tree {{
-            padding: 8px 16px 8px 32px;
-        }}
-        
-        .model-item {{
-            display: flex;
-            align-items: center;
-            padding: 6px 0;
-            font-size: 13px;
-            border-bottom: 1px solid var(--border-color);
-        }}
-        
-        .model-item:last-child {{
-            border-bottom: none;
-        }}
-        
-        .model-name {{
-            flex: 1;
-            color: var(--accent-purple);
-        }}
-        
-        .model-stat {{
-            margin-left: 16px;
-            color: var(--text-secondary);
-            min-width: 80px;
-            text-align: right;
-        }}
-        
-        .model-stat.cost {{
-            color: var(--accent-green);
-        }}
-        
-        .copy-btn {{
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            color: var(--text-primary);
-            padding: 4px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-            margin-right: 4px;
-            transition: background 0.2s;
-        }}
-        
-        .copy-btn:hover {{
-            background: var(--accent-blue);
-            border-color: var(--accent-blue);
-        }}
-        
-        .icon-btn {{
-            background: transparent;
-            border: none;
-            color: var(--text-secondary);
-            cursor: pointer;
-            font-size: 14px;
-            padding: 4px;
-            margin-right: 4px;
-            transition: color 0.2s;
-        }}
-        
-        .icon-btn:hover {{
-            color: var(--accent-blue);
-        }}
-        
-        .session-link {{
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-size: 14px;
-            padding: 4px;
-            transition: color 0.2s;
-        }}
-        
-        .session-link:hover {{
-            color: var(--accent-blue);
-        }}
-        
-        footer {{
-            text-align: center;
-            padding: 24px;
-            color: var(--text-secondary);
-            font-size: 13px;
-        }}
+{dashboard_css}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Agent Cost Dashboard</h1>
-        <p class="subtitle">Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} <span class="refresh-note">(Refresh page for updated stats)</span></p>
-        
+        <h1>Agent Cost Dashboard</h1>
+        <p class="subtitle">Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} <span class="refresh-note">Refresh page for updated stats</span></p>
+
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="label">Total Cost</div>
@@ -2147,13 +1774,10 @@ def generate_html():
                 <div class="value">{global_stats["total_sessions"]}</div>
             </div>
             <div class="stat-card">
-                <div class="label">API Calls</div>
-                <div class="value">{global_stats["total_messages"]:,}</div>
+                <div class="label">LLM Calls</div>
+                <div class="value" title="{format_full_number(global_stats["total_messages"])}">{format_tokens(global_stats["total_messages"])}</div>
             </div>
-            <div class="stat-card">
-                <div class="label">Total Tokens</div>
-                <div class="value">{global_stats["total_tokens"] / 1_000_000:.1f}M</div>
-            </div>
+            {token_summary_card}
             <div class="stat-card">
                 <div class="label">LLM Time</div>
                 <div class="value" style="color: var(--accent-purple)">{format_duration(global_stats["total_llm_time"])}</div>
@@ -2167,214 +1791,29 @@ def generate_html():
                 <div class="value" style="color: var(--accent-blue)">{calc_avg_tokens_per_sec(global_stats["tps_samples"]):.1f}</div>
             </div>
         </div>
-        
+
         <div class="section">
             <div class="section-header">
-                <span>📊 Daily Spending</span>
+                <span>Daily Spending</span>
             </div>
-            <div class="daily-chart" id="daily-chart-content">
-"""
-
-    # Build daily stats JSON for client-side chart rendering.
-    # Each entry: {day, cost, models: {modelName: cost}}
-    daily_stats_list = []
-    for day in sorted(global_stats["daily_stats"].keys()):
-        day_data = global_stats["daily_stats"][day]
-        daily_stats_list.append(
-            {
-                "day": day,
-                "cost": day_data["cost"],
-                "models": day_data.get("models", {}),
-            }
-        )
-    daily_stats_json = json.dumps(daily_stats_list)
-
-    html_content += f"""
-            </div>
-            <script>
-            (function() {{
-                const dailyStats = {daily_stats_json};
-
-                // Collect all model names ordered by total cost (highest first)
-                const modelTotals = {{}};
-                dailyStats.forEach(d => {{
-                    Object.entries(d.models).forEach(([m, c]) => {{
-                        modelTotals[m] = (modelTotals[m] || 0) + c;
-                    }});
-                }});
-                const allModels = Object.keys(modelTotals).sort(
-                    (a, b) => modelTotals[b] - modelTotals[a]
-                );
-
-                // Distinct colour palette — one colour per model.
-                // We cycle through a fixed set so the same model always
-                // gets the same colour across page reloads.
-                const PALETTE = [
-                    '#3fb950', // green  (matches accent-green)
-                    '#58a6ff', // blue
-                    '#a371f7', // purple
-                    '#d29922', // yellow
-                    '#f85149', // red
-                    '#39d353', // bright green
-                    '#79c0ff', // light blue
-                    '#ff7b72', // salmon
-                    '#ffa657', // orange
-                    '#56d364', // lime
-                    '#bc8cff', // lavender
-                    '#e3b341', // amber
-                ];
-                function modelColor(model, idx) {{
-                    return PALETTE[idx % PALETTE.length];
-                }}
-
-                // Only show the last 14 days by default; full history is
-                // accessible via a toggle.
-                const RECENT_DAYS = 14;
-                let showAll = false;
-
-                function getVisibleDays() {{
-                    return showAll ? dailyStats : dailyStats.slice(-RECENT_DAYS);
-                }}
-
-                function render() {{
-                    const visible = getVisibleDays();
-                    if (!visible.length) return;
-
-                    const maxCost = Math.max(...visible.map(d => d.cost), 0.0001);
-
-                    // Group days by YYYY-MM for monthly totals
-                    const monthTotals = {{}};
-                    visible.forEach(d => {{
-                        const month = d.day.slice(0, 7);
-                        if (!monthTotals[month]) {{
-                            monthTotals[month] = {{cost: 0, models: {{}}}};
-                        }}
-                        monthTotals[month].cost += d.cost;
-                        Object.entries(d.models).forEach(([m, c]) => {{
-                            monthTotals[month].models[m] =
-                                (monthTotals[month].models[m] || 0) + c;
-                        }});
-                    }});
-
-                    let html = '';
-
-                    // Legend
-                    if (allModels.length > 0) {{
-                        html += '<div class="daily-legend">';
-                        allModels.forEach((m, i) => {{
-                            const color = modelColor(m, i);
-                            const shortName = m.length > 35
-                                ? m.slice(0, 32) + '...' : m;
-                            html += `<span class="legend-item">
-                                <span class="legend-dot" style="background:${{color}}"></span>
-                                ${{shortName}}
-                            </span>`;
-                        }});
-                        html += '</div>';
-                    }}
-
-                    let prevMonth = null;
-
-                    visible.forEach(d => {{
-                        const month = d.day.slice(0, 7);
-
-                        // Insert monthly total separator when month changes
-                        // (after we have seen all days of the previous month)
-                        if (prevMonth && month !== prevMonth) {{
-                            const mt = monthTotals[prevMonth];
-                            const mtPct = (mt.cost / maxCost * 100).toFixed(1);
-                            html += renderMonthRow(prevMonth, mt, maxCost);
-                        }}
-                        prevMonth = month;
-
-                        // Stacked bar for this day
-                        const pct = (d.cost / maxCost * 100);
-                        let stackedSegments = '';
-                        let usedPct = 0;
-                        allModels.forEach((m, i) => {{
-                            const mCost = d.models[m] || 0;
-                            const mPct = (mCost / maxCost * 100);
-                            if (mPct < 0.01) return;
-                            stackedSegments += `<div class="bar-segment" style="width:${{mPct.toFixed(2)}}%;background:${{modelColor(m, i)}}" title="${{m}}: $${{mCost.toFixed(4)}}"></div>`;
-                            usedPct += mPct;
-                        }});
-
-                        html += `
-                            <div class="daily-bar">
-                                <span class="date">${{d.day}}</span>
-                                <div class="bar-wrapper">
-                                    <div class="bar-container stacked">
-                                        ${{stackedSegments}}
-                                    </div>
-                                </div>
-                                <span class="amount">$${{d.cost.toFixed(2)}}</span>
-                            </div>`;
-                    }});
-
-                    // Monthly total for the last visible month
-                    if (prevMonth) {{
-                        html += renderMonthRow(prevMonth, monthTotals[prevMonth], maxCost);
-                    }}
-
-                    // Toggle button
-                    const totalDays = dailyStats.length;
-                    if (totalDays > RECENT_DAYS) {{
-                        const label = showAll
-                            ? 'Show last 14 days'
-                            : `Show all ${{totalDays}} days`;
-                        html += `<div style="margin-top:12px;text-align:center">
-                            <button onclick="toggleDailyChart()" class="copy-btn">${{label}}</button>
-                        </div>`;
-                    }}
-
-                    document.getElementById('daily-chart-content').innerHTML = html;
-                }}
-
-                function renderMonthRow(month, mt, maxCost) {{
-                    const [year, mon] = month.split('-');
-                    const label = new Date(year, mon - 1).toLocaleString('default',
-                        {{month: 'long', year: 'numeric'}});
-                    const pct = (mt.cost / maxCost * 100);
-                    let segments = '';
-                    allModels.forEach((m, i) => {{
-                        const mCost = mt.models[m] || 0;
-                        const mPct = (mCost / maxCost * 100);
-                        if (mPct < 0.01) return;
-                        segments += `<div class="bar-segment" style="width:${{mPct.toFixed(2)}}%;background:${{modelColor(m, i)}};opacity:0.55" title="${{m}}: $${{mCost.toFixed(4)}}"></div>`;
-                    }});
-                    return `
-                        <div class="monthly-total-row">
-                            <span class="date monthly-label">${{label}}</span>
-                            <div class="bar-wrapper">
-                                <div class="bar-container stacked">
-                                    ${{segments}}
-                                </div>
-                            </div>
-                            <span class="amount monthly-amount">$${{mt.cost.toFixed(2)}}</span>
-                        </div>`;
-                }}
-
-                window.toggleDailyChart = function() {{
-                    showAll = !showAll;
-                    render();
-                }};
-
-                render();
-            }})();
-            </script>
+            <div class="daily-chart" id="daily-chart-content"></div>
         </div>
-        </div>
-        
+
         <div class="section">
             <div class="section-header">
-                <span>🤖 Models Used</span>
+                <span>Models Used</span>
             </div>
             <table>
                 <thead>
                     <tr>
                         <th>Model</th>
                         <th>Messages</th>
-                        <th>Tokens</th>
+                        <th>Total</th>
+                        <th>Input</th>
+                        <th>Output</th>
+                        <th>Cache Read</th>
+                        <th>Cache Write</th>
+                        <th>Reasoning</th>
                         <th>Avg Tokens/s</th>
                         <th>Cost</th>
                         <th>% of Total</th>
@@ -2401,8 +1840,13 @@ def generate_html():
         html_content += f"""
                     <tr>
                         <td><span class="model-tag {model_class}">{html.escape(model)}</span></td>
-                        <td>{mstats["messages"]:,}</td>
-                        <td class="tokens">{mstats["tokens"]:,}</td>
+                        <td title="{format_full_number(mstats["messages"])}">{format_tokens(mstats["messages"])}</td>
+                        <td class="tokens" title="{format_full_number(mstats["tokens"])}">{format_tokens(mstats["tokens"])}</td>
+                        <td class="tokens" title="{format_full_number(mstats["input_tokens"])}">{format_tokens(mstats["input_tokens"])}</td>
+                        <td class="tokens" title="{format_full_number(mstats["output_tokens"])}">{format_tokens(mstats["output_tokens"])}</td>
+                        <td class="tokens" title="{format_full_number(mstats["cache_read_tokens"])}">{format_tokens(mstats["cache_read_tokens"])}</td>
+                        <td class="tokens" title="{format_full_number(mstats["cache_write_tokens"])}">{format_tokens(mstats["cache_write_tokens"])}</td>
+                        <td class="tokens" title="{format_full_number(mstats["reasoning_tokens"])}">{format_tokens(mstats["reasoning_tokens"])}</td>
                         <td style="color: var(--accent-blue)">{model_tps:.1f}</td>
                         <td class="cost">${mstats["cost"]:.2f}</td>
                         <td>
@@ -2418,10 +1862,10 @@ def generate_html():
                 </tbody>
             </table>
         </div>
-        
+
         <div class="section">
             <div class="section-header">
-                <span>🔧 Tools Used</span>
+                <span>Tools Used</span>
             </div>
             <table>
                 <thead>
@@ -2451,7 +1895,7 @@ def generate_html():
         html_content += f'''
                     <tr>
                         <td><span class="model-tag model-other">{html.escape(tool_name)}</span></td>
-                        <td>{tstats["calls"]:,}</td>
+                        <td title="{format_full_number(tstats["calls"])}">{format_tokens(tstats["calls"])}</td>
                         <td style="color: var(--accent-yellow)">{format_duration(tstats["time"])}</td>
                         <td style="color: var(--text-secondary)">{format_duration(avg_time)}</td>
                         <td style="{error_style}">{tstats["errors"]}</td>
@@ -2464,18 +1908,15 @@ def generate_html():
                     </tr>
 '''
 
-    html_content += (
-        """
+    html_content += f"""
                 </tbody>
             </table>
         </div>
-        
+
         <div class="section">
             <div class="section-header">
-                <span>📁 Projects</span>
-                <span class="badge">"""
-        + str(len(all_projects))
-        + """ projects</span>
+                <span>Projects</span>
+                <span class="badge">{len(all_projects)} projects</span>
             </div>
             <table id="projects-table">
                 <thead>
@@ -2495,10 +1936,10 @@ def generate_html():
                 </tbody>
             </table>
         </div>
-        
+
         <div class="section">
             <div class="section-header">
-                <span>📜 All Sessions</span>
+                <span>All Sessions</span>
                 <span class="badge" id="sessions-count"></span>
             </div>
             <table id="sessions-table">
@@ -2520,448 +1961,20 @@ def generate_html():
                 </tbody>
             </table>
         </div>
-        
+
         <footer>
             Agent Cost Dashboard • Data from ~/.pi, ~/.omp, ~/.claude, and ~/.codex
         </footer>
     </div>
-    
     <script>
-        const projects = """
-        + json.dumps(projects_json)
-        + """;
-
-        function buildResumeCmd(agentCmd, cwd, sessionPath, sessionUid) {
-            if (agentCmd === 'claude') {
-                return 'cd "' + cwd + '" && claude --resume "' + sessionUid + '"';
-            } else if (agentCmd === 'codex') {
-                return 'cd "' + cwd + '" && codex --resume "' + sessionUid + '"';
-            } else {
-                return 'cd "' + cwd + '" && ' + agentCmd + ' --session "' + sessionPath + '"';
-            }
-        }
-
-        function formatDuration(seconds) {
-            if (seconds < 60) {
-                return Math.round(seconds) + 's';
-            } else if (seconds < 3600) {
-                const mins = Math.floor(seconds / 60);
-                const secs = Math.round(seconds % 60);
-                return mins + 'm' + secs.toString().padStart(2, '0') + 's';
-            } else {
-                const hours = Math.floor(seconds / 3600);
-                const mins = Math.round((seconds % 3600) / 60);
-                return hours + 'h' + mins.toString().padStart(2, '0') + 'm';
-            }
-        }
-
-        // Flatten all sessions for the sessions table
-        const allSessions = [];
-        projects.forEach(p => {
-            p.sessions_list.forEach(s => {
-                allSessions.push({
-                    project: p.name,
-                    ...s
-                });
-            });
-        });
-
-        // Group sessions by project for expandable display
-        const sessionsByProject = {};
-        allSessions.forEach(s => {
-            if (!sessionsByProject[s.project]) {
-                sessionsByProject[s.project] = [];
-            }
-            sessionsByProject[s.project].push(s);
-        });
-
-        let projectSort = { field: 'last_activity', asc: false };
-        let sessionSort = { field: 'end', asc: false };  // Sort by last activity (most recent first)
-        let sessionsSort = { field: 'end', asc: false };
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-        
-        function sortData(data, sort) {
-            return [...data].sort((a, b) => {
-                let aVal = a[sort.field];
-                let bVal = b[sort.field];
-                
-                if (typeof aVal === 'string') {
-                    aVal = aVal.toLowerCase();
-                    bVal = bVal.toLowerCase();
-                }
-                
-                if (aVal < bVal) return sort.asc ? -1 : 1;
-                if (aVal > bVal) return sort.asc ? 1 : -1;
-                return 0;
-            });
-        }
-        
-        function renderProjects() {
-            const tbody = document.getElementById('projects-tbody');
-            const sorted = sortData(projects, projectSort);
-            const maxCost = Math.max(...projects.map(p => p.cost));
-            
-            tbody.innerHTML = sorted.map((p, idx) => {
-                const shortName = p.name.length > 50 ? '...' + p.name.slice(-47) : p.name;
-                const rowId = 'project-' + idx;
-                
-                // Build model breakdown HTML
-                const modelRows = p.models.map(m => `
-                    <div class="model-item">
-                        <span class="model-name">${escapeHtml(m.name)}</span>
-                        <span class="model-stat">${m.messages} msgs</span>
-                        <span class="model-stat">${m.tokens.toLocaleString()} tok</span>
-                        <span class="model-stat" style="color: var(--accent-blue)">${(m.avg_tps || 0).toFixed(1)} tok/s</span>
-                        <span class="model-stat cost">$${m.cost.toFixed(2)}</span>
-                    </div>
-                `).join('');
-                
-                // Build tool breakdown HTML
-                const toolRows = (p.tools || []).map(t => `
-                    <div class="model-item">
-                        <span class="model-name" style="color: var(--accent-yellow)">${escapeHtml(t.name)}</span>
-                        <span class="model-stat">${t.calls} calls</span>
-                        <span class="model-stat" style="color: var(--accent-yellow)">${t.time_display}</span>
-                        <span class="model-stat">avg ${t.avg_time_display}</span>
-                        ${t.errors > 0 ? `<span class="model-stat" style="color: var(--accent-red)">${t.errors} errors</span>` : ''}
-                    </div>
-                `).join('');
-                
-                return `
-                    <tr class="expandable-row" data-target="${rowId}" onclick="toggleProjectRow('${rowId}')">
-                        <td class="project-name" title="${escapeHtml(p.name)}"><span class="expand-icon">▶</span> ${escapeHtml(shortName)}</td>
-                        <td>${p.sessions}</td>
-                        <td>${p.messages.toLocaleString()}</td>
-                        <td class="tokens">${p.tokens.toLocaleString()}</td>
-                        <td style="color: var(--accent-purple)">${p.llm_time_display}</td>
-                        <td style="color: var(--accent-yellow)">${p.tool_time_display}</td>
-                        <td style="color: var(--accent-blue)">${(p.avg_tps || 0).toFixed(1)}</td>
-                        <td class="cost">$${p.cost.toFixed(2)}</td>
-                        <td style="color: var(--text-secondary)">${p.last_activity_display}</td>
-                    </tr>
-                    <tr class="model-breakdown" id="${rowId}">
-                        <td colspan="9">
-                            <div class="model-tree">
-                                <div style="font-weight: 600; margin-bottom: 8px; color: var(--text-secondary)">Models:</div>
-                                ${modelRows || '<div style="color: var(--text-secondary)">No model data</div>'}
-                                ${toolRows ? `<div style="font-weight: 600; margin: 12px 0 8px 0; color: var(--text-secondary)">Tools:</div>${toolRows}` : ''}
-                            </div>
-                        </td>
-                    </tr>
-                `;
-            }).join('');
-        }
-        
-        function toggleProjectRow(rowId) {
-            const row = document.getElementById(rowId);
-            const parentRow = document.querySelector('[data-target="' + rowId + '"]');
-            row.classList.toggle('show');
-            parentRow.classList.toggle('expanded');
-        }
-        
-        function renderSessions() {
-            const tbody = document.getElementById('sessions-tbody');
-
-            // Flatten sessions with subagent info
-            const allSessionsWithSubs = [];
-            projects.forEach(p => {
-                p.sessions_list.forEach(s => {
-                    // Add agent_cmd from parent project for resume command
-                    allSessionsWithSubs.push({...s, agent_cmd: p.agent_cmd});
-                });
-            });
-
-            // Helper to get aggregated value for a session (including subagents)
-            function getAggregatedValue(s, field) {
-                const subs = s.subagent_sessions || [];
-                const all = [s, ...subs];
-                
-                switch(field) {
-                    case 'cost':
-                        return all.reduce((sum, session) => sum + session.cost, 0);
-                    case 'tokens':
-                        return all.reduce((sum, session) => sum + session.tokens, 0);
-                    case 'messages':
-                        return all.reduce((sum, session) => sum + session.messages, 0);
-                    case 'llm_time':
-                        return all.reduce((sum, session) => sum + (session.llm_time || 0), 0);
-                    case 'tool_time':
-                        return all.reduce((sum, session) => sum + (session.tool_time || 0), 0);
-                    case 'avg_tps':
-                        const tpsValues = all.map(session => session.avg_tps || 0).filter(v => v > 0);
-                        return tpsValues.length > 0 ? tpsValues.reduce((a, b) => a + b, 0) / tpsValues.length : 0;
-                    case 'duration':
-                        const starts = all.map(session => session.start).filter(Boolean);
-                        const ends = all.map(session => session.end).filter(Boolean);
-                        if (!starts.length || !ends.length) return 0;
-                        const earliest = Math.min(...starts.map(d => new Date(d)));
-                        const latest = Math.max(...ends.map(d => new Date(d)));
-                        return (latest - earliest) / 1000;
-                    case 'start':
-                        return s.start ? new Date(s.start).getTime() : 0;
-                    case 'project':
-                        return s.cwd.toLowerCase();
-                    default:
-                        return s[field] || 0;
-                }
-            }
-            
-            // Sort sessions using current sort state
-            const sortedSessions = [...allSessionsWithSubs].sort((a, b) => {
-                const aVal = getAggregatedValue(a, sessionsSort.field);
-                const bVal = getAggregatedValue(b, sessionsSort.field);
-                
-                if (aVal < bVal) return sessionsSort.asc ? -1 : 1;
-                if (aVal > bVal) return sessionsSort.asc ? 1 : -1;
-                return 0;
-            });
-
-            const totalSessions = allSessionsWithSubs.reduce((sum, s) => sum + 1 + (s.subagent_sessions || []).length, 0);
-            document.getElementById('sessions-count').textContent = totalSessions + ' sessions';
-
-            let html = '';
-            let rowIdx = 0;
-
-            sortedSessions.forEach(s => {
-                const subs = s.subagent_sessions || [];
-                const hasSubs = subs.length > 0;
-
-                // If no subagent sessions, just show the main session as a regular row
-                if (!hasSubs) {
-                    const sessionUrl = '/session?uid=' + encodeURIComponent(s.uid);
-                    const resumePath = s.path.replace(/\\\\/g, '/');
-                    const resumeCmd = buildResumeCmd(s.agent_cmd, s.cwd, resumePath, s.uid);
-                    const encodedCmd = encodeURIComponent(resumeCmd);
-                    const shortProject = s.cwd.length > 40 ? '...' + s.cwd.slice(-37) : s.cwd;
-
-                    html += `
-                        <tr>
-                            <td class="project-name" title="${escapeHtml(s.cwd)}">${escapeHtml(shortProject)}</td>
-                            <td style="color: var(--text-secondary)">${s.start_display}</td>
-                            <td style="color: var(--text-secondary)">${s.duration_display}</td>
-                            <td style="color: var(--accent-purple)">${s.llm_time_display}</td>
-                            <td style="color: var(--accent-yellow)">${s.tool_time_display || '0s'}</td>
-                            <td style="color: var(--accent-blue)">${(s.avg_tps || 0).toFixed(1)}</td>
-                            <td>${s.messages.toLocaleString()}</td>
-                            <td class="tokens">${s.tokens.toLocaleString()}</td>
-                            <td class="cost">$${s.cost.toFixed(2)}</td>
-                            <td>
-                                <button onclick="copyResumeCommand(event, decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
-                                <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
-                            </td>
-                        </tr>
-                    `;
-                    return;
-                }
-
-                // Has subagent sessions - show expandable summary
-                const allSessionsInGroup = [s, ...subs];
-                const projectId = 'session-group-' + rowIdx;
-                rowIdx++;
-
-                // Calculate aggregated totals
-                const aggCost = allSessionsInGroup.reduce((sum, session) => sum + session.cost, 0);
-                const aggTokens = allSessionsInGroup.reduce((sum, session) => sum + session.tokens, 0);
-                const aggMessages = allSessionsInGroup.reduce((sum, session) => sum + session.messages, 0);
-                const aggLlmTime = allSessionsInGroup.reduce((sum, session) => sum + (session.llm_time || 0), 0);
-                const aggToolTime = allSessionsInGroup.reduce((sum, session) => sum + (session.tool_time || 0), 0);
-
-                // Get earliest start and latest end
-                const starts = allSessionsInGroup.map(session => session.start).filter(Boolean);
-                const ends = allSessionsInGroup.map(session => session.end).filter(Boolean);
-                const earliestStart = starts.length ? new Date(Math.min(...starts.map(d => new Date(d)))) : null;
-                const latestEnd = ends.length ? new Date(Math.max(...ends.map(d => new Date(d)))) : null;
-                const totalDuration = earliestStart && latestEnd ? (latestEnd - earliestStart) / 1000 : 0;
-
-                const shortProject = s.cwd.length > 40 ? '...' + s.cwd.slice(-37) : s.cwd;
-
-                // Format date to match other sessions (YYYY-MM-DD HH:MM)
-                const dateDisplay = s.start_display;
-
-                // Summary row with resume/open buttons
-                const sessionUrl = '/session?uid=' + encodeURIComponent(s.uid);
-                const resumePath = s.path.replace(/\\\\/g, '/');
-                const resumeCmd = buildResumeCmd(s.agent_cmd, s.cwd, resumePath, s.uid);
-                const encodedCmd = encodeURIComponent(resumeCmd);
-
-                // Calculate average tokens/sec for aggregated sessions
-                const tpsValues = allSessionsInGroup.map(session => session.avg_tps || 0).filter(v => v > 0);
-                const aggAvgTps = tpsValues.length > 0 ? tpsValues.reduce((a, b) => a + b, 0) / tpsValues.length : 0;
-
-                html += `
-                    <tr class="expandable-row" data-target="${projectId}" onclick="toggleProjectRow('${projectId}')">
-                        <td class="project-name" title="${escapeHtml(s.cwd)}">
-                            <span class="expand-icon">▶</span>
-                            ${escapeHtml(shortProject)}
-                        </td>
-                        <td style="color: var(--text-secondary)">${dateDisplay}</td>
-                        <td style="color: var(--text-secondary)">${formatDuration(totalDuration)}</td>
-                        <td style="color: var(--accent-purple)">${formatDuration(aggLlmTime)}</td>
-                        <td style="color: var(--accent-yellow)">${formatDuration(aggToolTime)}</td>
-                        <td style="color: var(--accent-blue)">${aggAvgTps.toFixed(1)}</td>
-                        <td>${aggMessages.toLocaleString()}</td>
-                        <td class="tokens">${aggTokens.toLocaleString()}</td>
-                        <td class="cost">$${aggCost.toFixed(2)}</td>
-                        <td>
-                            <button onclick="event.stopPropagation(); copyResumeCommand(event, decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
-                            <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session" onclick="event.stopPropagation()">Open →</a>
-                        </td>
-                    </tr>
-                    <tr class="model-breakdown" id="${projectId}">
-                        <td colspan="10" style="padding: 0">
-                            <div class="model-tree">
-                `;
-
-                // Main session with buttons
-                html += `
-                    <div class="model-item">
-                        <span class="model-name" title="${escapeHtml(s.file)}">
-                            <strong>📁 Main Session:</strong> ${escapeHtml(s.file)}
-                        </span>
-                        <span class="model-stat">${s.start_display}</span>
-                        <span class="model-stat">${s.duration_display}</span>
-                        <span class="model-stat" style="color: var(--accent-purple)">${s.llm_time_display}</span>
-                        <span class="model-stat" style="color: var(--accent-yellow)">${s.tool_time_display || '0s'}</span>
-                        <span class="model-stat" style="color: var(--accent-blue)">${(s.avg_tps || 0).toFixed(1)} tok/s</span>
-                        <span class="model-stat">${s.messages} msgs</span>
-                        <span class="model-stat">${s.tokens.toLocaleString()} tok</span>
-                        <span class="model-stat cost">$${s.cost.toFixed(2)}</span>
-                        <span style="margin-left: 8px">
-                            <button onclick="copyResumeCommand(event, decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
-                            <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
-                        </span>
-                    </div>
-                `;
-
-                // Subagent sessions with buttons
-                subs.forEach(sub => {
-                    const subSessionUrl = '/session?uid=' + encodeURIComponent(sub.uid);
-                    const subResumePath = sub.path.replace(/\\\\/g, '/');
-                    // Use parent session's agent_cmd for subagent resume command
-                    const subResumeCmd = buildResumeCmd(s.agent_cmd, sub.cwd, subResumePath, sub.uid);
-                    const subEncodedCmd = encodeURIComponent(subResumeCmd);
-
-                    // Just show the filename, not the full relative path
-                    const fileName = sub.file;
-
-                    html += `
-                        <div class="model-item">
-                            <span class="model-name" title="${escapeHtml(sub.relative_path)}">
-                                ${escapeHtml(fileName)}
-                            </span>
-                            <span class="model-stat">${sub.start_display}</span>
-                            <span class="model-stat">${sub.duration_display}</span>
-                            <span class="model-stat" style="color: var(--accent-purple)">${sub.llm_time_display}</span>
-                            <span class="model-stat" style="color: var(--accent-yellow)">${sub.tool_time_display || '0s'}</span>
-                            <span class="model-stat" style="color: var(--accent-blue)">${(sub.avg_tps || 0).toFixed(1)} tok/s</span>
-                            <span class="model-stat">${sub.messages} msgs</span>
-                            <span class="model-stat">${sub.tokens.toLocaleString()} tok</span>
-                            <span class="model-stat cost">$${sub.cost.toFixed(2)}</span>
-                            <span style="margin-left: 8px">
-                                <button onclick="copyResumeCommand(event, decodeURIComponent('${subEncodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
-                                <a href="${subSessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
-                            </span>
-                        </div>
-                    `;
-                });
-
-                html += `
-                            </div>
-                        </td>
-                    </tr>
-                `;
-            });
-
-            tbody.innerHTML = html;
-        }
-        
-        function copyResumeCommand(event, cmd) {
-            const btn = event.target;
-            
-            function showSuccess() {
-                const originalText = btn.textContent;
-                btn.textContent = '✓';
-                btn.style.color = 'var(--accent-green)';
-                setTimeout(() => {
-                    btn.textContent = originalText;
-                    btn.style.color = '';
-                }, 1500);
-            }
-            
-            // Use clipboard API if available (HTTPS or localhost)
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(cmd).then(showSuccess).catch(err => {
-                    console.error('Failed to copy:', err);
-                });
-            } else {
-                // Fallback for HTTP contexts
-                const textArea = document.createElement('textarea');
-                textArea.value = cmd;
-                textArea.style.position = 'fixed';
-                textArea.style.left = '-9999px';
-                textArea.setAttribute('readonly', '');
-                document.body.appendChild(textArea);
-                textArea.select();
-                try {
-                    document.execCommand('copy');
-                    showSuccess();
-                } catch (err) {
-                    console.error('Fallback copy failed:', err);
-                }
-                document.body.removeChild(textArea);
-            }
-        }
-        
-        function setupSorting(tableId, sortState, renderFn) {
-            document.querySelectorAll(`#${tableId} th[data-sort]`).forEach(th => {
-                th.addEventListener('click', () => {
-                    const field = th.dataset.sort;
-                    if (sortState.field === field) {
-                        sortState.asc = !sortState.asc;
-                    } else {
-                        sortState.field = field;
-                        sortState.asc = field === 'name' || field === 'project' || field === 'start';
-                    }
-                    updateSortIcons(tableId, sortState);
-                    renderFn();
-                });
-            });
-        }
-        
-        function updateSortIcons(tableId, sortState) {
-            document.querySelectorAll(`#${tableId} th`).forEach(th => {
-                const field = th.dataset.sort;
-                const icon = th.querySelector('.sort-icon');
-                if (!icon) return;
-                if (field === sortState.field) {
-                    th.classList.add('sorted');
-                    icon.textContent = sortState.asc ? '▲' : '▼';
-                } else {
-                    th.classList.remove('sorted');
-                    icon.textContent = '▼';
-                }
-            });
-        }
-        
-        // Setup
-        setupSorting('projects-table', projectSort, renderProjects);
-        setupSorting('sessions-table', sessionsSort, renderSessions);
-
-        // Initial render
-        renderProjects();
-        renderSessions();
-        updateSortIcons('projects-table', projectSort);
-        updateSortIcons('sessions-table', sessionsSort);
+        window.dashboardData = {dashboard_data_json};
+    </script>
+    <script>
+{dashboard_js}
     </script>
 </body>
 </html>
 """
-    )
 
     return html_content
 
