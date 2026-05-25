@@ -192,7 +192,7 @@ def get_session_id_from_file(
         return Path(filepath).stem
 
     try:
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             first_line = f.readline().strip()
             if first_line:
                 data = json.loads(first_line)
@@ -696,7 +696,7 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
     jsonl_files = sorted(project_dir.glob("*.jsonl"))
     for filepath in jsonl_files:
         try:
-            with open(filepath, "r") as f:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -736,7 +736,7 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
     cwd = ""
 
     try:
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             # First, try to read cwd from the session line
             first_line = f.readline().strip()
             if first_line:
@@ -877,7 +877,7 @@ def analyze_claude_jsonl_file(filepath: Path) -> SessionStats:
     cwd = ""
 
     try:
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     data = json.loads(line.strip())
@@ -1086,7 +1086,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
     previous_total_usage = None
 
     try:
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     data = json.loads(line.strip())
@@ -1343,6 +1343,8 @@ def run_export_subprocess(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     run_kwargs = {
         "capture_output": True,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
         "timeout": 30,
     }
 
@@ -1407,7 +1409,7 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
 def get_session_cwd(session_path: str, source_type: str = "standard") -> str:
     """Get the working directory from a session file."""
     try:
-        with open(session_path, "r") as f:
+        with open(session_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:

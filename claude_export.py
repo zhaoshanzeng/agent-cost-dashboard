@@ -261,7 +261,7 @@ def export_session(input_path: str) -> str:
     last_ts = ""
     version = ""
 
-    with open(input_path, "r") as f:
+    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -442,7 +442,7 @@ def main():
         sys.exit(1)
 
     html_content = export_session(input_path)
-    Path(output_path).write_text(html_content)
+    Path(output_path).write_text(html_content, encoding="utf-8")
 
 
 if __name__ == "__main__":
