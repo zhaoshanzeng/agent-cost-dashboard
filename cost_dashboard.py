@@ -209,7 +209,7 @@ def get_session_id_from_file(
 
 # Manual pricing for models that report zero cost (price per million tokens).
 # Format: model_pattern -> {"input": price_per_M, "output": price_per_M, "cache_read": price_per_M}
-# Prices sourced from OpenRouter (openrouter.ai/api/v1/models) as of 2026-02.
+# Prices sourced from OpenRouter (openrouter.ai/api/v1/models) as of 2026-05
 #
 # Rules:
 #  - Only add entries for specific known model versions. No broad family prefixes
@@ -222,32 +222,38 @@ MANUAL_PRICING = {
     "gemini-2.5-pro": {
         "input": 1.25,
         "output": 10.00,
-        "cache_read": 0.31,
+        "cache_read": 0.125,
+        "cache_write": 0.375,
     },
     "gemini-2.5-flash": {
         "input": 0.30,
         "output": 2.50,
-        "cache_read": 0.075,
+        "cache_read": 0.03,
+        "cache_write": 0.083,
     },
     "gemini-2.0-flash": {
         "input": 0.10,
         "output": 0.40,
         "cache_read": 0.025,
+        "cache_write": 0.083,
     },
     "gemini-3-flash-preview": {
         "input": 0.50,
         "output": 3.00,
-        "cache_read": 0.0,
+        "cache_read": 0.05,
+        "cache_write": 0.083,
     },
     "gemini-3-pro-preview": {
         "input": 2.00,
         "output": 12.00,
-        "cache_read": 0.0,
+        "cache_read": 0.20,
+        "cache_write": 0.375,
     },
     "gemini-3.1-pro-preview": {
         "input": 2.00,
         "output": 12.00,
-        "cache_read": 0.0,
+        "cache_read": 0.20,
+        "cache_write": 0.375,
     },
     # ── Claude (Anthropic API pricing per 1M tokens) ──────────────────────────
     # Specific version strings avoid mislabelling different-priced variants.
@@ -298,22 +304,22 @@ MANUAL_PRICING = {
     },
     # ── GLM (Z-AI / ZhipuAI) ─────────────────────────────────────────────────
     "glm-4.7": {
-        "input": 0.30,
-        "output": 1.40,
+        "input": 0.38,
+        "output": 1.74,
         "cache_read": 0.0,
         "cache_write": 0.0,
     },
     "glm-4.5-air": {
         "input": 0.13,
         "output": 0.85,
-        "cache_read": 0.0,
+        "cache_read": 0.025,
         "cache_write": 0.0,
     },
     # ── Grok (xAI) ───────────────────────────────────────────────────────────
     "grok-code-fast-1": {
         "input": 0.20,
         "output": 1.50,
-        "cache_read": 0.0,
+        "cache_read": 0.02,
     },
     # ── OpenAI / Codex ────────────────────────────────────────────────────────
     # More specific patterns before less specific ones.
@@ -337,6 +343,11 @@ MANUAL_PRICING = {
         "input": 1.25,
         "output": 10.0,
         "cache_read": 0.125,
+    },
+    "gpt-5.4": {
+        "input": 2.50,
+        "output": 15.0,
+        "cache_read": 0.25,
     },
     "o3": {
         "input": 2.0,
