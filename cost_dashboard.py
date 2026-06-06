@@ -2,6 +2,7 @@
 """Serve a dynamic HTML dashboard with cost statistics for all pi-agent sessions."""
 
 import json
+import re
 import subprocess
 import tempfile
 import urllib.parse
@@ -296,6 +297,31 @@ MANUAL_PRICING = {
         "cache_read": 0.5,
         "cache_write": 6.25,
     },
+    # claude-opus-4.7 / 4.8 — same $5/$25 tier as 4.5/4.6
+    "claude-opus-4.7": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    "claude-opus-4-7": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    "claude-opus-4.8": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    "claude-opus-4-8": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
     # claude-opus-4.0 / 4.1 — $15/$75 (different, more expensive model)
     "claude-opus-4.1": {
         "input": 15.0,
@@ -375,6 +401,95 @@ MANUAL_PRICING = {
 }
 
 
+# Live pricing from OpenRouter, read from the committed models.json next to this
+# script (refresh it with `python3 update_models.py`). Prices are per-token
+# strings that we convert to dollars-per-million. MANUAL_PRICING above is the
+# offline fallback for models missing from the file.
+OPENROUTER_MODELS_FILE = Path(__file__).parent / "models.json"
+_OPENROUTER_PRICING: dict[str, dict[str, float]] | None = None
+
+
+def _normalize_model_name(name: str) -> str:
+    """Collapse a model id to a vendor-/format-agnostic key for matching.
+
+    Drops any 'vendor/' prefix, lowercases, strips a trailing YYYYMMDD date
+    stamp, and unifies '.'/'-' version separators so 'claude-opus-4-8',
+    'anthropic/claude-opus-4.8' and 'claude-opus-4-8-20260528' all collapse to
+    the same key.
+    """
+    name = name.split("/")[-1].lower()
+    name = re.sub(r"-20\d{6}$", "", name)
+    return name.replace(".", "-")
+
+
+def _load_openrouter_models() -> dict:
+    """Return the OpenRouter models payload from the local models.json.
+
+    Returns {} when the file is missing or unreadable (built-in pricing is then
+    used as a fallback)."""
+    if not OPENROUTER_MODELS_FILE.exists():
+        print(
+            f"{OPENROUTER_MODELS_FILE.name} not found; using built-in pricing. "
+            "Run `python3 update_models.py` to fetch live pricing."
+        )
+        return {}
+    try:
+        return json.loads(OPENROUTER_MODELS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _build_openrouter_pricing() -> dict[str, dict[str, float]]:
+    """Build {normalized_model -> per-million pricing} from the OpenRouter data."""
+    pricing: dict[str, dict[str, float]] = {}
+    for m in _load_openrouter_models().get("data", []):
+        model_id = m.get("id")
+        raw = m.get("pricing") or {}
+        if not model_id:
+            continue
+
+        def per_million(key: str) -> float:
+            try:
+                return float(raw.get(key, 0) or 0) * 1_000_000
+            except (TypeError, ValueError):
+                return 0.0
+
+        entry = {
+            "input": per_million("prompt"),
+            "output": per_million("completion"),
+            "cache_read": per_million("input_cache_read"),
+            "cache_write": per_million("input_cache_write"),
+        }
+        key = _normalize_model_name(model_id)
+        # Don't let a $0 variant clobber an already-priced entry.
+        if key in pricing and entry["input"] == 0 and entry["output"] == 0:
+            continue
+        pricing[key] = entry
+    return pricing
+
+
+def get_openrouter_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int = 0,
+) -> float | None:
+    """Cost from live OpenRouter pricing, or None when the model isn't listed."""
+    global _OPENROUTER_PRICING
+    if _OPENROUTER_PRICING is None:
+        _OPENROUTER_PRICING = _build_openrouter_pricing()
+    pricing = _OPENROUTER_PRICING.get(_normalize_model_name(model))
+    if not pricing:
+        return None
+    return (
+        (input_tokens / 1_000_000) * pricing["input"]
+        + (output_tokens / 1_000_000) * pricing["output"]
+        + (cache_read_tokens / 1_000_000) * pricing["cache_read"]
+        + (cache_write_tokens / 1_000_000) * pricing["cache_write"]
+    )
+
+
 def get_manual_cost(
     model: str,
     input_tokens: int,
@@ -382,7 +497,13 @@ def get_manual_cost(
     cache_read_tokens: int,
     cache_write_tokens: int = 0,
 ) -> float:
-    """Calculate cost using manual pricing if available."""
+    """Calculate cost, preferring live OpenRouter pricing, then the built-in table."""
+    or_cost = get_openrouter_cost(
+        model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+    )
+    if or_cost is not None:
+        return or_cost
+
     for pattern, pricing in MANUAL_PRICING.items():
         if pattern in model.lower():
             input_cost = (input_tokens / 1_000_000) * pricing["input"]
@@ -727,16 +848,14 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
                         continue
                     data = json.loads(line)
                     if source_type == "claude":
-                        # Skip records that don't carry cwd
-                        if data.get("type") in (
-                            "queue-operation",
-                            "progress",
-                            "file-history-snapshot",
-                            "summary",
-                        ):
-                            continue
+                        # Most Claude records carry cwd (user, assistant, ...)
+                        # but header/meta lines (permission-mode,
+                        # file-history-snapshot, summary, ...) do not. Keep
+                        # scanning the file until one with cwd shows up rather
+                        # than giving up on the first line.
                         if data.get("cwd"):
                             return data["cwd"]
+                        continue
                     elif source_type == "codex":
                         if data.get("type") == "session_meta":
                             cwd = data.get("payload", {}).get("cwd")
@@ -1111,6 +1230,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
     model = ""
     pending_tool_calls = {}  # call_id -> {"name": str, "timestamp": datetime}
     previous_total_usage = None
+    previous_token_count_sig = None
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -1144,6 +1264,18 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                     info = payload.get("info")
                     if not isinstance(info, dict):
                         continue
+
+                    # Codex emits each token_count event twice in a row with
+                    # identical usage. Skip the duplicate so we don't count it
+                    # (and its cost) twice. total_token_usage is cumulative and
+                    # monotonic, so distinct real turns never share a signature.
+                    token_count_sig = (
+                        info.get("last_token_usage"),
+                        info.get("total_token_usage"),
+                    )
+                    if token_count_sig == previous_token_count_sig:
+                        continue
+                    previous_token_count_sig = token_count_sig
 
                     last_usage = parse_usage(info.get("last_token_usage"))
                     total_usage = parse_usage(info.get("total_token_usage"))
@@ -1246,24 +1378,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
 
 def analyze_gemini_jsonl_file(filepath: Path) -> SessionStats:
     """Analyze a Gemini CLI JSONL session file and return stats."""
-    stats: SessionStats = {
-        "messages": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "total_tokens": 0,
-        "cost_total": 0.0,
-        "models": defaultdict(create_model_stats),
-        "timestamps": [],
-        "start": None,
-        "end": None,
-        "llm_time": 0.0,
-        "tool_time": 0.0,
-        "tools": defaultdict(create_tool_stats),
-        "tps_samples": [],
-        "cwd": "",
-    }
+    stats = create_session_stats()
 
     # Try to find cwd from history
     project_name = filepath.parent.parent.name
