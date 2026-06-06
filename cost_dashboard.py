@@ -1751,10 +1751,66 @@ def generate_html():
             }
         )
 
+    # Build global models JSON for client-side sorting
+    total_cost_val = global_stats["total_cost"] if global_stats["total_cost"] > 0 else 1
+    models_json = []
+    for model_name, mstats in global_stats["models"].items():
+        model_tps = (
+            mstats.get("output_tokens", 0) / mstats.get("llm_time", 1)
+            if mstats.get("llm_time", 0) > 0
+            else 0
+        )
+        models_json.append(
+            {
+                "name": model_name,
+                "messages": mstats["messages"],
+                "tokens": mstats["tokens"],
+                "input_tokens": mstats.get("input_tokens", 0),
+                "output_tokens": mstats.get("output_tokens", 0),
+                "cache_read_tokens": mstats.get("cache_read_tokens", 0),
+                "cache_write_tokens": mstats.get("cache_write_tokens", 0),
+                "reasoning_tokens": mstats.get("reasoning_tokens", 0),
+                "llm_time": mstats.get("llm_time", 0),
+                "cost": mstats["cost"],
+                "avg_tps": model_tps,
+                "pct": mstats["cost"] / total_cost_val * 100,
+            }
+        )
+
+    # Build global tools JSON for client-side sorting
+    total_tool_time_val = global_stats["total_tool_time"] if global_stats["total_tool_time"] > 0 else 1
+    tools_json = []
+    for tool_name, tstats in global_stats["tools"].items():
+        tools_json.append(
+            {
+                "name": tool_name,
+                "calls": tstats["calls"],
+                "time": tstats["time"],
+                "time_display": format_duration(tstats["time"]),
+                "errors": tstats["errors"],
+                "avg_time": tstats["time"] / tstats["calls"]
+                if tstats["calls"] > 0
+                else 0,
+                "avg_time_display": format_duration(
+                    tstats["time"] / tstats["calls"]
+                )
+                if tstats["calls"] > 0
+                else "0s",
+                "pct": tstats["time"] / total_tool_time_val * 100,
+            }
+        )
+
     dashboard_css = load_asset("dashboard.css")
     dashboard_js = load_asset("dashboard.js")
     dashboard_data_json = json_for_script(
-        {"projects": projects_json, "dailyStats": daily_stats_list}
+        {
+            "projects": projects_json,
+            "dailyStats": daily_stats_list,
+            "models": models_json,
+            "tools": tools_json,
+            "totalCost": global_stats["total_cost"],
+            "totalToolTime": global_stats["total_tool_time"],
+        }
     )
     token_summary_card = render_token_summary_card(global_stats)
 
@@ -1816,62 +1872,23 @@ def generate_html():
             <div class="section-header">
                 <span>Models Used</span>
             </div>
-            <table>
+            <table id="models-table">
                 <thead>
                     <tr>
-                        <th>Model</th>
-                        <th>Messages</th>
-                        <th>Total</th>
-                        <th>Input</th>
-                        <th>Output</th>
-                        <th>Cache Read</th>
-                        <th>Cache Write</th>
-                        <th>Reasoning</th>
-                        <th>Avg Tokens/s</th>
-                        <th>Cost</th>
-                        <th>% of Total</th>
+                        <th data-sort="name">Model <span class="sort-icon">▼</span></th>
+                        <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
+                        <th data-sort="tokens">Total <span class="sort-icon">▼</span></th>
+                        <th data-sort="input_tokens">Input <span class="sort-icon">▼</span></th>
+                        <th data-sort="output_tokens">Output <span class="sort-icon">▼</span></th>
+                        <th data-sort="cache_read_tokens">Cache Read <span class="sort-icon">▼</span></th>
+                        <th data-sort="cache_write_tokens">Cache Write <span class="sort-icon">▼</span></th>
+                        <th data-sort="reasoning_tokens">Reasoning <span class="sort-icon">▼</span></th>
+                        <th data-sort="avg_tps">Avg Tokens/s <span class="sort-icon">▼</span></th>
+                        <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
+                        <th data-sort="pct">% of Total <span class="sort-icon">▼</span></th>
                     </tr>
                 </thead>
-                <tbody>
-"""
-
-    for model, mstats in sorted(
-        global_stats["models"].items(), key=lambda x: -x[1]["cost"]
-    ):
-        pct = (
-            (mstats["cost"] / global_stats["total_cost"] * 100)
-            if global_stats["total_cost"] > 0
-            else 0
-        )
-        model_class = "model-claude" if "claude" in model.lower() else "model-other"
-        # Calculate tokens/second for this model
-        model_tps = (
-            mstats["output_tokens"] / mstats["llm_time"]
-            if mstats.get("llm_time", 0) > 0
-            else 0
-        )
-        html_content += f"""
-                    <tr>
-                        <td><span class="model-tag {model_class}">{html.escape(model)}</span></td>
-                        <td title="{format_full_number(mstats["messages"])}">{format_tokens(mstats["messages"])}</td>
-                        <td class="tokens" title="{format_full_number(mstats["tokens"])}">{format_tokens(mstats["tokens"])}</td>
-                        <td class="tokens" title="{format_full_number(mstats["input_tokens"])}">{format_tokens(mstats["input_tokens"])}</td>
-                        <td class="tokens" title="{format_full_number(mstats["output_tokens"])}">{format_tokens(mstats["output_tokens"])}</td>
-                        <td class="tokens" title="{format_full_number(mstats["cache_read_tokens"])}">{format_tokens(mstats["cache_read_tokens"])}</td>
-                        <td class="tokens" title="{format_full_number(mstats["cache_write_tokens"])}">{format_tokens(mstats["cache_write_tokens"])}</td>
-                        <td class="tokens" title="{format_full_number(mstats["reasoning_tokens"])}">{format_tokens(mstats["reasoning_tokens"])}</td>
-                        <td style="color: var(--accent-blue)">{model_tps:.1f}</td>
-                        <td class="cost">${mstats["cost"]:.2f}</td>
-                        <td>
-                            <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
-                                <div class="bar" style="width: {pct}%"></div>
-                            </div>
-                            {pct:.1f}%
-                        </td>
-                    </tr>
-"""
-
-    html_content += """
+                <tbody id="models-tbody">
                 </tbody>
             </table>
         </div>
@@ -1880,48 +1897,18 @@ def generate_html():
             <div class="section-header">
                 <span>Tools Used</span>
             </div>
-            <table>
+            <table id="tools-table">
                 <thead>
                     <tr>
-                        <th>Tool</th>
-                        <th>Calls</th>
-                        <th>Total Time</th>
-                        <th>Avg Time</th>
-                        <th>Errors</th>
-                        <th>% of Time</th>
+                        <th data-sort="name">Tool <span class="sort-icon">▼</span></th>
+                        <th data-sort="calls">Calls <span class="sort-icon">▼</span></th>
+                        <th data-sort="time">Total Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="avg_time">Avg Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="errors">Errors <span class="sort-icon">▼</span></th>
+                        <th data-sort="pct">% of Time <span class="sort-icon">▼</span></th>
                     </tr>
                 </thead>
-                <tbody>
-"""
-
-    total_tool_time = global_stats["total_tool_time"]
-    for tool_name, tstats in sorted(
-        global_stats["tools"].items(), key=lambda x: -x[1]["time"]
-    ):
-        pct = (tstats["time"] / total_tool_time * 100) if total_tool_time > 0 else 0
-        avg_time = tstats["time"] / tstats["calls"] if tstats["calls"] > 0 else 0
-        error_style = (
-            "color: var(--accent-red)"
-            if tstats["errors"] > 0
-            else "color: var(--text-secondary)"
-        )
-        html_content += f'''
-                    <tr>
-                        <td><span class="model-tag model-other">{html.escape(tool_name)}</span></td>
-                        <td title="{format_full_number(tstats["calls"])}">{format_tokens(tstats["calls"])}</td>
-                        <td style="color: var(--accent-yellow)">{format_duration(tstats["time"])}</td>
-                        <td style="color: var(--text-secondary)">{format_duration(avg_time)}</td>
-                        <td style="{error_style}">{tstats["errors"]}</td>
-                        <td>
-                            <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
-                                <div class="bar" style="width: {pct}%; background: var(--accent-yellow)"></div>
-                            </div>
-                            {pct:.1f}%
-                        </td>
-                    </tr>
-'''
-
-    html_content += f"""
+                <tbody id="tools-tbody">
                 </tbody>
             </table>
         </div>

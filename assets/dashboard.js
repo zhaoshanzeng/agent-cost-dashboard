@@ -652,12 +652,97 @@ function updateSortIcons(tableId, sortState) {
     });
 }
 
+// ── Models table sorting ──────────────────────────────────────────────
+const models = dashboardData.models || [];
+const totalCost = dashboardData.totalCost || 1;
+let modelSort = { field: 'cost', asc: false };
+
+function renderModels() {
+    const tbody = document.getElementById('models-tbody');
+    const sorted = sortData(models, modelSort);
+
+    tbody.innerHTML = sorted.map(m => {
+        const modelClass = m.name.toLowerCase().includes('claude') ? 'model-claude' : 'model-other';
+        const tokenDetail = [
+            ['In', m.input_tokens],
+            ['Out', m.output_tokens],
+            ['Cache read', m.cache_read_tokens],
+            ['Cache write', m.cache_write_tokens],
+            ['Reasoning', m.reasoning_tokens],
+        ].filter(([, v]) => v > 0).map(([l, v]) => `${l} ${formatCompactNumber(v)}`).join(' · ');
+        const tokenTitle = [
+            `Total: ${formatFullNumber(m.tokens)}`,
+            `In: ${formatFullNumber(m.input_tokens)}`,
+            `Out: ${formatFullNumber(m.output_tokens)}`,
+            `Cache read: ${formatFullNumber(m.cache_read_tokens)}`,
+            `Cache write: ${formatFullNumber(m.cache_write_tokens)}`,
+            `Reasoning: ${formatFullNumber(m.reasoning_tokens)}`,
+        ].join('\n');
+
+        return `
+            <tr>
+                <td><span class="model-tag ${modelClass}">${escapeHtml(m.name)}</span></td>
+                <td title="${formatFullNumber(m.messages)}">${formatCompactNumber(m.messages)}</td>
+                <td class="tokens" title="${escapeHtml(tokenTitle)}">${formatCompactNumber(m.tokens)}</td>
+                <td class="tokens" title="${formatFullNumber(m.input_tokens)}">${formatCompactNumber(m.input_tokens)}</td>
+                <td class="tokens" title="${formatFullNumber(m.output_tokens)}">${formatCompactNumber(m.output_tokens)}</td>
+                <td class="tokens" title="${formatFullNumber(m.cache_read_tokens)}">${formatCompactNumber(m.cache_read_tokens)}</td>
+                <td class="tokens" title="${formatFullNumber(m.cache_write_tokens)}">${formatCompactNumber(m.cache_write_tokens)}</td>
+                <td class="tokens" title="${formatFullNumber(m.reasoning_tokens)}">${formatCompactNumber(m.reasoning_tokens)}</td>
+                <td style="color: var(--accent-blue)">${(m.avg_tps || 0).toFixed(1)}</td>
+                <td class="cost">$${m.cost.toFixed(2)}</td>
+                <td>
+                    <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
+                        <div class="bar" style="width: ${m.pct}%"></div>
+                    </div>
+                    ${m.pct.toFixed(1)}%
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+// ── Tools table sorting ───────────────────────────────────────────────
+const tools = dashboardData.tools || [];
+const totalToolTime = dashboardData.totalToolTime || 1;
+let toolSort = { field: 'time', asc: false };
+
+function renderTools() {
+    const tbody = document.getElementById('tools-tbody');
+    const sorted = sortData(tools, toolSort);
+
+    tbody.innerHTML = sorted.map(t => {
+        const errorStyle = t.errors > 0 ? 'color: var(--accent-red)' : 'color: var(--text-secondary)';
+        return `
+            <tr>
+                <td><span class="model-tag model-other">${escapeHtml(t.name)}</span></td>
+                <td title="${formatFullNumber(t.calls)}">${formatCompactNumber(t.calls)}</td>
+                <td style="color: var(--accent-yellow)">${t.time_display}</td>
+                <td style="color: var(--text-secondary)">${t.avg_time_display}</td>
+                <td style="${errorStyle}">${t.errors}</td>
+                <td>
+                    <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
+                        <div class="bar" style="width: ${t.pct}%; background: var(--accent-yellow)"></div>
+                    </div>
+                    ${t.pct.toFixed(1)}%
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
 // Setup
 setupSorting('projects-table', projectSort, renderProjects);
 setupSorting('sessions-table', sessionsSort, renderSessions);
+setupSorting('models-table', modelSort, renderModels);
+setupSorting('tools-table', toolSort, renderTools);
 
 // Initial render
 renderProjects();
 renderSessions();
+renderModels();
+renderTools();
 updateSortIcons('projects-table', projectSort);
 updateSortIcons('sessions-table', sessionsSort);
+updateSortIcons('models-table', modelSort);
+updateSortIcons('tools-table', toolSort);
