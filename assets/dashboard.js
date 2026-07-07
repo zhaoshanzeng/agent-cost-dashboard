@@ -43,7 +43,9 @@ const dashboardData = window.dashboardData || {};
     let showAll = false;
 
     function getVisibleDays() {
-        return showAll ? dailyStats : dailyStats.slice(-RECENT_DAYS);
+        // dailyStats is already sorted newest-first from the server,
+        // so slice from the start to take the most recent RECENT_DAYS.
+        return showAll ? dailyStats : dailyStats.slice(0, RECENT_DAYS);
     }
 
     function render() {

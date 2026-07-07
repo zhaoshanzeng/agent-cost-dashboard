@@ -2010,8 +2010,9 @@ def generate_html():
 
     # Build daily stats JSON for client-side chart rendering.
     # Each entry: {day, cost, models: {modelName: cost}}
+    # Sorted newest first so the most recent day appears on top.
     daily_stats_list = []
-    for day in sorted(global_stats["daily_stats"].keys()):
+    for day in sorted(global_stats["daily_stats"].keys(), reverse=True):
         day_data = global_stats["daily_stats"][day]
         daily_stats_list.append(
             {
