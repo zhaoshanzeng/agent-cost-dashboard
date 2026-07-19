@@ -228,6 +228,16 @@ const dashboardData = window.dashboardData || {};
         return d;
     }
 
+    function formatTokens(val) {
+        var n = Math.abs(Number(val) || 0);
+        var sign = val < 0 ? '-' : '';
+        if (n >= 1000000000000) return sign + (n / 1000000000000).toFixed(1) + 'T';
+        if (n >= 1000000000) return sign + (n / 1000000000).toFixed(1) + 'B';
+        if (n >= 1000000) return sign + (n / 1000000).toFixed(1) + 'M';
+        if (n >= 1000) return sign + (n / 1000).toFixed(1) + 'k';
+        return sign + String(Math.round(n));
+    }
+
     function renderTodayChart() {
         var container = document.getElementById('today-chart-content');
         var legendEl = document.getElementById('today-chart-legend');
@@ -389,6 +399,83 @@ const dashboardData = window.dashboardData || {};
         svg += '</svg>';
 
         container.innerHTML = svg;
+
+        // 11. 添加悬停 tooltip 的透明 hit area
+        var svgEl = container.querySelector('svg');
+        if (svgEl && sortedBuckets.length > 0) {
+            // 创建 tooltip 元素（如果不存在）
+            var tooltip = document.getElementById('today-tooltip');
+            if (!tooltip) {
+                tooltip = document.createElement('div');
+                tooltip.id = 'today-tooltip';
+                tooltip.style.cssText = 'position:absolute;display:none;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:12px;line-height:1.6;pointer-events:none;z-index:100;white-space:nowrap;color:#e6edf3;';
+                container.style.position = 'relative';
+                container.appendChild(tooltip);
+            }
+
+            // 计算每个桶在容器中的实际像素宽度
+            var firstX = xScale(sortedBuckets[0].ts);
+            var lastX = xScale(sortedBuckets[sortedBuckets.length - 1].ts);
+            var bucketWidth = (lastX - firstX) / sortedBuckets.length;
+            var hitWidth = Math.max(bucketWidth * 0.8, 4);
+
+            // 添加 hit area 矩形
+            for (var i = 0; i < sortedBuckets.length; i++) {
+                var b = sortedBuckets[i];
+                var cx = xScale(b.ts);
+                var hitX = cx - hitWidth / 2;
+
+                var rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+                rect.setAttribute('x', hitX.toFixed(2));
+                rect.setAttribute('y', '0');
+                rect.setAttribute('width', hitWidth.toFixed(2));
+                rect.setAttribute('height', svgH);
+                rect.setAttribute('fill', 'transparent');
+                rect.setAttribute('data-index', String(i));
+
+                // 构建 tooltip 内容
+                var ttTime = formatTimeLabel(b.ts, range);
+                var ttLines = '<div style="font-weight:600;margin-bottom:4px;color:#8b949e;">' + ttTime + '</div>';
+                for (var m = 0; m < models.length; m++) {
+                    var mdl = models[m];
+                    var tok = b.modelTokens[mdl] || 0;
+                    if (tok > 0) {
+                        var color = modelColor(mdl, m);
+                        var shortName = mdl.length > 30 ? mdl.slice(0, 28) + '...' : mdl;
+                        ttLines += '<div style="display:flex;justify-content:space-between;gap:16px;">' +
+                            '<span><span style="display:inline-block;width:8px;height:2px;background:' + color + ';vertical-align:middle;margin-right:4px;"></span>' + escapeHtml(shortName) + '</span>' +
+                            '<span style="text-align:right;font-weight:600;">' + formatTokens(tok) + '</span>' +
+                            '</div>';
+                    }
+                }
+
+                rect.addEventListener('mouseenter', (function(html) {
+                    return function() {
+                        tooltip.innerHTML = html;
+                        tooltip.style.display = 'block';
+                    };
+                })(ttLines));
+
+                rect.addEventListener('mousemove', function(e) {
+                    var rect_ = container.getBoundingClientRect();
+                    var tx = e.clientX - rect_.left + 12;
+                    var ty = e.clientY - rect_.top - 10;
+                    // 防止 tooltip 超出容器右侧
+                    var ttW = tooltip.offsetWidth;
+                    if (tx + ttW > rect_.width - 10) {
+                        tx = e.clientX - rect_.left - ttW - 12;
+                    }
+                    tooltip.style.left = Math.max(0, tx) + 'px';
+                    tooltip.style.top = Math.max(0, ty - tooltip.offsetHeight) + 'px';
+                });
+
+                rect.addEventListener('mouseleave', function() {
+                    tooltip.style.display = 'none';
+                });
+
+                svgEl.appendChild(rect);
+            }
+        }
 
         // 10. 渲染图例
         if (legendEl) {
