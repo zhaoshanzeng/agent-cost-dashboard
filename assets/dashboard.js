@@ -372,11 +372,9 @@ const dashboardData = window.dashboardData || {};
             svg += '<text x="' + (pad.left - 8) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end" fill="#8b949e" font-size="11">' + label + '</text>';
         }
 
-        // X 轴标签 + 竖虚线
+        // X 轴标签
         for (var i = 0; i < xLabels.length; i++) {
             var x = xScale(xLabels[i]);
-            // 竖虚线（从图表顶部到底部）
-            svg += '<line x1="' + x.toFixed(2) + '" y1="' + pad.top + '" x2="' + x.toFixed(2) + '" y2="' + (svgH - pad.bottom) + '" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>';
             var label = formatTimeLabel(xLabels[i], range);
             svg += '<text x="' + x.toFixed(2) + '" y="' + (svgH - 6) + '" text-anchor="middle" fill="#8b949e" font-size="11">' + label + '</text>';
         }
@@ -402,7 +400,7 @@ const dashboardData = window.dashboardData || {};
 
         container.innerHTML = svg;
 
-        // 11. 添加悬停 tooltip 的透明 hit area
+        // 11. 添加鼠标追踪辅助线 + tooltip
         var svgEl = container.querySelector('svg');
         if (svgEl && sortedBuckets.length > 0) {
             // 创建 tooltip 元素（如果不存在）
@@ -415,27 +413,28 @@ const dashboardData = window.dashboardData || {};
                 container.appendChild(tooltip);
             }
 
-            // 计算每个桶在容器中的实际像素宽度
-            var firstX = xScale(sortedBuckets[0].ts);
-            var lastX = xScale(sortedBuckets[sortedBuckets.length - 1].ts);
-            var bucketWidth = (lastX - firstX) / sortedBuckets.length;
-            var hitWidth = Math.max(bucketWidth * 0.8, 4);
+            // 添加追踪竖线（SVG 内部）
+            var tracker = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            tracker.setAttribute('y1', String(pad.top));
+            tracker.setAttribute('y2', String(svgH - pad.bottom));
+            tracker.setAttribute('x1', '0');
+            tracker.setAttribute('x2', '0');
+            tracker.setAttribute('stroke', '#8b949e');
+            tracker.setAttribute('stroke-width', '1');
+            tracker.setAttribute('stroke-dasharray', '4,4');
+            tracker.setAttribute('display', 'none');
+            svgEl.appendChild(tracker);
 
-            // 添加 hit area 矩形
+            // 计算每个桶的 x 中心位置（用于查找最近桶）
+            var bucketCenters = [];
+            for (var i = 0; i < sortedBuckets.length; i++) {
+                bucketCenters.push(xScale(sortedBuckets[i].ts));
+            }
+
+            // 预先构建每个桶的 tooltip HTML
+            var bucketTooltips = [];
             for (var i = 0; i < sortedBuckets.length; i++) {
                 var b = sortedBuckets[i];
-                var cx = xScale(b.ts);
-                var hitX = cx - hitWidth / 2;
-
-                var rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-                rect.setAttribute('x', hitX.toFixed(2));
-                rect.setAttribute('y', '0');
-                rect.setAttribute('width', hitWidth.toFixed(2));
-                rect.setAttribute('height', svgH);
-                rect.setAttribute('fill', 'transparent');
-                rect.setAttribute('data-index', String(i));
-
-                // 构建 tooltip 内容
                 var ttTime = formatTimeLabel(b.ts, range);
                 var ttLines = '<div style="font-weight:600;margin-bottom:4px;color:#8b949e;">' + ttTime + '</div>';
                 for (var m = 0; m < models.length; m++) {
@@ -450,33 +449,55 @@ const dashboardData = window.dashboardData || {};
                             '</div>';
                     }
                 }
-
-                rect.addEventListener('mouseenter', (function(html) {
-                    return function() {
-                        tooltip.innerHTML = html;
-                        tooltip.style.display = 'block';
-                    };
-                })(ttLines));
-
-                rect.addEventListener('mousemove', function(e) {
-                    var rect_ = container.getBoundingClientRect();
-                    var tx = e.clientX - rect_.left + 12;
-                    var ty = e.clientY - rect_.top - 10;
-                    // 防止 tooltip 超出容器右侧
-                    var ttW = tooltip.offsetWidth;
-                    if (tx + ttW > rect_.width - 10) {
-                        tx = e.clientX - rect_.left - ttW - 12;
-                    }
-                    tooltip.style.left = Math.max(0, tx) + 'px';
-                    tooltip.style.top = Math.max(0, ty - tooltip.offsetHeight) + 'px';
-                });
-
-                rect.addEventListener('mouseleave', function() {
-                    tooltip.style.display = 'none';
-                });
-
-                svgEl.appendChild(rect);
+                bucketTooltips.push(ttLines);
             }
+
+            // 鼠标移动时追踪
+            container.addEventListener('mousemove', function(e) {
+                var rect_ = container.getBoundingClientRect();
+                var mx = e.clientX - rect_.left;
+
+                // 找到最近的桶
+                var nearest = 0;
+                var minDist = Infinity;
+                for (var i = 0; i < bucketCenters.length; i++) {
+                    var dist = Math.abs(mx - bucketCenters[i]);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearest = i;
+                    }
+                }
+
+                // 更新追踪竖线位置
+                var cx = bucketCenters[nearest];
+                tracker.setAttribute('x1', cx.toFixed(2));
+                tracker.setAttribute('x2', cx.toFixed(2));
+                tracker.setAttribute('display', 'block');
+
+                // 更新 tooltip 内容
+                tooltip.innerHTML = bucketTooltips[nearest];
+
+                // 定位 tooltip（鼠标右下方）
+                var tx = e.clientX - rect_.left + 14;
+                var ty = e.clientY - rect_.top + 14;
+                var ttW = tooltip.offsetWidth;
+                var ttH = tooltip.offsetHeight;
+                if (tx + ttW > rect_.width - 10) {
+                    tx = e.clientX - rect_.left - ttW - 14;
+                }
+                if (ty + ttH > rect_.height - 10) {
+                    ty = e.clientY - rect_.top - ttH - 14;
+                }
+                tooltip.style.left = Math.max(0, tx) + 'px';
+                tooltip.style.top = Math.max(0, ty) + 'px';
+                tooltip.style.display = 'block';
+            });
+
+            // 鼠标离开容器时隐藏
+            container.addEventListener('mouseleave', function() {
+                tracker.setAttribute('display', 'none');
+                tooltip.style.display = 'none';
+            });
         }
 
         // 10. 渲染图例
