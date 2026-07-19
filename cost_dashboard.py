@@ -743,6 +743,7 @@ def create_project_stats(name: str, agent_cmd: str) -> ProjectStats:
         "first_activity": None,
         "last_activity": None,
         "tps_samples": [],
+        "time_series": [],
     }
 
 
@@ -816,6 +817,7 @@ def accumulate_session_into_project(
     project_stats["total_llm_time"] += stats["llm_time"]
     project_stats["total_tool_time"] += stats["tool_time"]
     project_stats["tps_samples"].extend(stats["tps_samples"])
+    project_stats["time_series"].extend(stats["time_series"])
 
     merge_model_stats(project_stats["models"], stats["models"])
     merge_tool_stats(project_stats["tools"], stats["tools"])
@@ -2082,6 +2084,28 @@ def generate_html():
 
     dashboard_css = load_asset("dashboard.css")
     dashboard_js = load_asset("dashboard.js")
+    # ── 今日实时统计：收集时间序列样本 ──
+    # 合并所有项目的 time_series，过滤出今日数据
+    all_time_series = []
+    for p in all_projects:
+        all_time_series.extend(p["time_series"])
+
+    today = datetime.now().date()
+    today_time_series = [
+        s for s in all_time_series
+        if s["ts"] is not None and s["ts"].date() == today
+    ]
+
+    # 序列化（ISO 格式时间戳）
+    today_series_json = [
+        {
+            "ts": s["ts"].isoformat(),
+            "model": s["model"],
+            "tokens": s["tokens"],
+        }
+        for s in today_time_series
+    ]
+
     dashboard_data_json = json_for_script(
         {
             "projects": projects_json,
@@ -2090,6 +2114,7 @@ def generate_html():
             "tools": tools_json,
             "totalCost": global_stats["total_cost"],
             "totalToolTime": global_stats["total_tool_time"],
+            "todayTimeSeries": today_series_json,
         }
     )
     token_summary_card = render_token_summary_card(global_stats)
@@ -2140,6 +2165,21 @@ def generate_html():
                 <div class="label">Avg Tokens/s</div>
                 <div class="value" style="color: var(--accent-blue)">{calc_avg_tokens_per_sec(global_stats["tps_samples"]):.1f}</div>
             </div>
+        </div>
+
+        <div class="section" id="today-stats-section">
+            <div class="section-header">
+                <span>今日实时统计</span>
+            </div>
+            <div class="time-range-selector">
+                <button data-range="3h" class="time-range-btn" onclick="switchTimeRange('3h')">最近 3 小时</button>
+                <button data-range="1h" class="time-range-btn" onclick="switchTimeRange('1h')">最近 1 小时</button>
+                <button data-range="5m" class="time-range-btn active" onclick="switchTimeRange('5m')">最近 5 分钟</button>
+            </div>
+            <div class="today-chart-container" id="today-chart-content">
+                <p class="muted" style="text-align:center;padding:40px 0;">加载中...</p>
+            </div>
+            <div class="chart-legend" id="today-chart-legend"></div>
         </div>
 
         <div class="section">
