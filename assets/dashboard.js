@@ -372,9 +372,11 @@ const dashboardData = window.dashboardData || {};
             svg += '<text x="' + (pad.left - 8) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end" fill="#8b949e" font-size="11">' + label + '</text>';
         }
 
-        // X 轴标签
+        // X 轴标签 + 竖虚线
         for (var i = 0; i < xLabels.length; i++) {
             var x = xScale(xLabels[i]);
+            // 竖虚线（从图表顶部到底部）
+            svg += '<line x1="' + x.toFixed(2) + '" y1="' + pad.top + '" x2="' + x.toFixed(2) + '" y2="' + (svgH - pad.bottom) + '" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>';
             var label = formatTimeLabel(xLabels[i], range);
             svg += '<text x="' + x.toFixed(2) + '" y="' + (svgH - 6) + '" text-anchor="middle" fill="#8b949e" font-size="11">' + label + '</text>';
         }
