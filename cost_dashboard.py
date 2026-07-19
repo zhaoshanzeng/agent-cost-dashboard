@@ -652,6 +652,7 @@ def create_session_stats() -> SessionStats:
         "tools": defaultdict(create_tool_stats),
         "tps_samples": [],
         "cwd": "",
+        "time_series": [],
     }
 
 
@@ -710,6 +711,14 @@ def record_llm_usage(
         mstats["llm_time"] += llm_delta
 
     _record_timestamp(stats, ts)
+
+    # Record time series sample for today's real-time chart
+    if ts is not None:
+        stats["time_series"].append({
+            "ts": ts,
+            "model": model_name,
+            "tokens": total,
+        })
 
 
 def create_project_stats(name: str, agent_cmd: str) -> ProjectStats:
