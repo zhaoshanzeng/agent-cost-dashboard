@@ -311,219 +311,64 @@ const dashboardData = window.dashboardData || {};
             if (total > maxTokens) maxTokens = total;
         }
 
-        // 6. SVG 尺寸
-        var svgW = 800, svgH = 250;
-        var pad = { top: 20, right: 20, bottom: 30, left: 60 };
-        var chartW = svgW - pad.left - pad.right;
-        var chartH = svgH - pad.top - pad.bottom;
+        // 6. 渲染为 Daily Spending 同款水平堆叠柱状图
+        var html = '';
 
-        var minTs = sortedBuckets[0].ts;
-        var maxTs = sortedBuckets[sortedBuckets.length - 1].ts;
-        var tsRange = Math.max(maxTs - minTs, 1);
-
-        function xScale(ts) {
-            return pad.left + ((ts - minTs) / tsRange) * chartW;
-        }
-        function yScale(tokens) {
-            return pad.top + chartH - (tokens / maxTokens) * chartH;
-        }
-
-        // 7. 生成 Y 轴刻度
-        var yStep = 1;
-        if (maxTokens <= 5) {
-            yStep = 1;
-        } else if (maxTokens <= 50) {
-            yStep = Math.ceil(maxTokens / 5 / 5) * 5;
-        } else if (maxTokens <= 500) {
-            yStep = Math.ceil(maxTokens / 5 / 10) * 10;
-        } else {
-            yStep = Math.ceil(maxTokens / 5 / 100) * 100;
-        }
-        yStep = Math.max(yStep, 1);
-        var yLabels = [];
-        for (var v = 0; v <= maxTokens; v += yStep) {
-            yLabels.push(v);
-        }
-        if (yLabels[yLabels.length - 1] < maxTokens) {
-            yLabels.push(maxTokens);
-        }
-
-        // 8. 生成 X 轴标签（最多 6 个）
-        var xLabelCount = Math.min(6, sortedBuckets.length);
-        var xStep = Math.max(1, Math.floor(sortedBuckets.length / xLabelCount));
-        var xLabels = [];
-        for (var i = 0; i < sortedBuckets.length; i += xStep) {
-            xLabels.push(sortedBuckets[i].ts);
-        }
-        // 确保最后一个标签
-        if (xLabels.length === 0 || xLabels[xLabels.length - 1] !== sortedBuckets[sortedBuckets.length - 1].ts) {
-            xLabels.push(sortedBuckets[sortedBuckets.length - 1].ts);
-        }
-
-        // 9. 构建 SVG
-        var svg = '<svg class="today-chart-svg" viewBox="0 0 ' + svgW + ' ' + svgH + '" xmlns="http://www.w3.org/2000/svg">';
-
-        // 网格线 + Y 轴标签
-        for (var i = 0; i < yLabels.length; i++) {
-            var v = yLabels[i];
-            var y = yScale(v);
-            svg += '<line x1="' + pad.left + '" y1="' + y.toFixed(2) + '" x2="' + (svgW - pad.right) + '" y2="' + y.toFixed(2) + '" stroke="#30363d" stroke-width="1"/>';
-            var label = v >= 1000 ? (v / 1000).toFixed(1) + 'k' : String(v);
-            svg += '<text x="' + (pad.left - 8) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end" fill="#8b949e" font-size="11">' + label + '</text>';
-        }
-
-        // X 轴标签
-        for (var i = 0; i < xLabels.length; i++) {
-            var x = xScale(xLabels[i]);
-            var label = formatTimeLabel(xLabels[i], range);
-            svg += '<text x="' + x.toFixed(2) + '" y="' + (svgH - 6) + '" text-anchor="middle" fill="#8b949e" font-size="11">' + label + '</text>';
-        }
-
-        // 柱状图 — 每个桶一组堆叠柱
-        // 计算柱宽
-        var firstX = xScale(sortedBuckets[0].ts);
-        var lastX = xScale(sortedBuckets[sortedBuckets.length - 1].ts);
-        var bucketSpan = (lastX - firstX) / sortedBuckets.length;
-        var barWidth = Math.max(bucketSpan * 0.7, 2);
-
-        for (var i = 0; i < sortedBuckets.length; i++) {
-            var b = sortedBuckets[i];
-            var cx = xScale(b.ts);
-            var barX = cx - barWidth / 2;
-
-            // 从底部开始堆叠
-            var stackBottom = pad.top + chartH;
-            for (var m = 0; m < models.length; m++) {
-                var mdl = models[m];
-                var tok = b.modelTokens[mdl] || 0;
-                if (tok > 0) {
-                    var color = modelColor(mdl, m);
-                    var segH = (tok / maxTokens) * chartH;
-                    var segTop = stackBottom - segH;
-                    svg += '<rect x="' + barX.toFixed(2) + '" y="' + segTop.toFixed(2) + '" width="' + barWidth.toFixed(2) + '" height="' + Math.max(segH, 1).toFixed(2) + '" fill="' + color + '" rx="1"/>';
-                    stackBottom = segTop;
-                }
-            }
-        }
-
-        svg += '</svg>';
-
-        container.innerHTML = svg;
-
-        // 11. 添加鼠标追踪辅助线 + tooltip
-        var svgEl = container.querySelector('svg');
-        if (svgEl && sortedBuckets.length > 0) {
-            // 创建 tooltip 元素（如果不存在）
-            var tooltip = document.getElementById('today-tooltip');
-            if (!tooltip) {
-                tooltip = document.createElement('div');
-                tooltip.id = 'today-tooltip';
-                tooltip.style.cssText = 'position:absolute;display:none;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:12px;line-height:1.6;pointer-events:none;z-index:100;white-space:nowrap;color:#e6edf3;';
-                container.style.position = 'relative';
-                container.appendChild(tooltip);
-            }
-
-            // 添加追踪竖线（SVG 内部）
-            var tracker = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-            tracker.setAttribute('y1', String(pad.top));
-            tracker.setAttribute('y2', String(svgH - pad.bottom));
-            tracker.setAttribute('x1', '0');
-            tracker.setAttribute('x2', '0');
-            tracker.setAttribute('stroke', '#8b949e');
-            tracker.setAttribute('stroke-width', '1');
-            tracker.setAttribute('stroke-dasharray', '4,4');
-            tracker.setAttribute('display', 'none');
-            svgEl.appendChild(tracker);
-
-            // 计算每个桶的 x 中心位置（用于查找最近桶）
-            var bucketCenters = [];
-            for (var i = 0; i < sortedBuckets.length; i++) {
-                bucketCenters.push(xScale(sortedBuckets[i].ts));
-            }
-
-            // 预先构建每个桶的 tooltip HTML
-            var bucketTooltips = [];
-            for (var i = 0; i < sortedBuckets.length; i++) {
-                var b = sortedBuckets[i];
-                var ttTime = formatTimeLabel(b.ts, range);
-                var ttLines = '<div style="font-weight:600;margin-bottom:4px;color:#8b949e;">' + ttTime + '</div>';
-                for (var m = 0; m < models.length; m++) {
-                    var mdl = models[m];
-                    var tok = b.modelTokens[mdl] || 0;
-                    if (tok > 0) {
-                        var color = modelColor(mdl, m);
-                        var shortName = mdl.length > 30 ? mdl.slice(0, 28) + '...' : mdl;
-                        ttLines += '<div style="display:flex;justify-content:space-between;gap:16px;">' +
-                            '<span><span style="display:inline-block;width:8px;height:2px;background:' + color + ';vertical-align:middle;margin-right:4px;"></span>' + escapeHtml(shortName) + '</span>' +
-                            '<span style="text-align:right;font-weight:600;">' + formatTokens(tok) + '</span>' +
-                            '</div>';
-                    }
-                }
-                bucketTooltips.push(ttLines);
-            }
-
-            // 鼠标移动时追踪
-            container.addEventListener('mousemove', function(e) {
-                var rect_ = container.getBoundingClientRect();
-                var mx = e.clientX - rect_.left;
-
-                // 找到最近的桶
-                var nearest = 0;
-                var minDist = Infinity;
-                for (var i = 0; i < bucketCenters.length; i++) {
-                    var dist = Math.abs(mx - bucketCenters[i]);
-                    if (dist < minDist) {
-                        minDist = dist;
-                        nearest = i;
-                    }
-                }
-
-                // 更新追踪竖线位置
-                var cx = bucketCenters[nearest];
-                tracker.setAttribute('x1', cx.toFixed(2));
-                tracker.setAttribute('x2', cx.toFixed(2));
-                tracker.setAttribute('display', 'block');
-
-                // 更新 tooltip 内容
-                tooltip.innerHTML = bucketTooltips[nearest];
-
-                // 定位 tooltip（鼠标右下方）
-                var tx = e.clientX - rect_.left + 14;
-                var ty = e.clientY - rect_.top + 14;
-                var ttW = tooltip.offsetWidth;
-                var ttH = tooltip.offsetHeight;
-                if (tx + ttW > rect_.width - 10) {
-                    tx = e.clientX - rect_.left - ttW - 14;
-                }
-                if (ty + ttH > rect_.height - 10) {
-                    ty = e.clientY - rect_.top - ttH - 14;
-                }
-                tooltip.style.left = Math.max(0, tx) + 'px';
-                tooltip.style.top = Math.max(0, ty) + 'px';
-                tooltip.style.display = 'block';
-            });
-
-            // 鼠标离开容器时隐藏
-            container.addEventListener('mouseleave', function() {
-                tracker.setAttribute('display', 'none');
-                tooltip.style.display = 'none';
-            });
-        }
-
-        // 10. 渲染图例
-        if (legendEl) {
-            var legendHtml = '';
-            for (var m = 0; m < models.length; m++) {
-                var model = models[m];
-                var color = modelColor(model, m);
-                var shortName = model.length > 35 ? model.slice(0, 32) + '...' : model;
-                legendHtml += '<span class="legend-item">' +
+        // 图例（与 Daily Spending 一致）
+        if (models.length > 0) {
+            html += '<div class="daily-legend">';
+            for (var i = 0; i < models.length; i++) {
+                var mdl = models[i];
+                var color = modelColor(mdl, i);
+                var shortName = mdl.length > 35 ? mdl.slice(0, 32) + '...' : mdl;
+                html += '<span class="legend-item">' +
                     '<span class="legend-dot" style="background:' + color + '"></span>' +
                     escapeHtml(shortName) +
                     '</span>';
             }
-            legendEl.innerHTML = legendHtml;
+            html += '</div>';
         }
+
+        // 每个桶一行
+        for (var i = 0; i < sortedBuckets.length; i++) {
+            var b = sortedBuckets[i];
+            var timeLabel = formatTimeLabel(b.ts, range);
+
+            // 计算该桶总 Token
+            var totalTok = 0;
+            for (var m = 0; m < models.length; m++) {
+                totalTok += (b.modelTokens[models[m]] || 0);
+            }
+
+            // 堆叠段
+            var stackedSegments = '';
+            for (var m = 0; m < models.length; m++) {
+                var mdl = models[m];
+                var tok = b.modelTokens[mdl] || 0;
+                if (tok > 0) {
+                    var mPct = (tok / maxTokens) * 100;
+                    if (mPct < 0.01) continue;
+                    var color = modelColor(mdl, m);
+                    var shortName = mdl.length > 30 ? mdl.slice(0, 28) + '...' : mdl;
+                    stackedSegments += '<div class="bar-segment" style="width:' + mPct.toFixed(2) + '%;background:' + color + '" title="' + escapeHtml(shortName) + ': ' + formatTokens(tok) + ' tokens"></div>';
+                }
+            }
+
+            html += '<div class="daily-bar">' +
+                '<span class="date">' + timeLabel + '</span>' +
+                '<div class="bar-wrapper">' +
+                    '<div class="bar-container stacked">' +
+                        stackedSegments +
+                    '</div>' +
+                '</div>' +
+                '<span class="amount">' + formatTokens(totalTok) + '</span>' +
+            '</div>';
+        }
+
+        container.innerHTML = html;
+
+        // 清空 legendEl（图例已在 container 内）
+        if (legendEl) legendEl.innerHTML = '';
     }
 
     // 暴露给 HTML onclick
