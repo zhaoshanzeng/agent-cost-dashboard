@@ -379,20 +379,30 @@ const dashboardData = window.dashboardData || {};
             svg += '<text x="' + x.toFixed(2) + '" y="' + (svgH - 6) + '" text-anchor="middle" fill="#8b949e" font-size="11">' + label + '</text>';
         }
 
-        // 曲线 — 每个模型一条
-        for (var m = 0; m < models.length; m++) {
-            var model = models[m];
-            var color = modelColor(model, m);
-            var points = [];
-            for (var i = 0; i < sortedBuckets.length; i++) {
-                points.push({
-                    x: xScale(sortedBuckets[i].ts),
-                    y: yScale(sortedBuckets[i].modelTokens[model] || 0)
-                });
-            }
-            var pathD = smoothPath(points);
-            if (pathD) {
-                svg += '<path d="' + pathD + '" stroke="' + color + '" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>';
+        // 柱状图 — 每个桶一组堆叠柱
+        // 计算柱宽
+        var firstX = xScale(sortedBuckets[0].ts);
+        var lastX = xScale(sortedBuckets[sortedBuckets.length - 1].ts);
+        var bucketSpan = (lastX - firstX) / sortedBuckets.length;
+        var barWidth = Math.max(bucketSpan * 0.7, 2);
+
+        for (var i = 0; i < sortedBuckets.length; i++) {
+            var b = sortedBuckets[i];
+            var cx = xScale(b.ts);
+            var barX = cx - barWidth / 2;
+
+            // 从底部开始堆叠
+            var stackBottom = pad.top + chartH;
+            for (var m = 0; m < models.length; m++) {
+                var mdl = models[m];
+                var tok = b.modelTokens[mdl] || 0;
+                if (tok > 0) {
+                    var color = modelColor(mdl, m);
+                    var segH = (tok / maxTokens) * chartH;
+                    var segTop = stackBottom - segH;
+                    svg += '<rect x="' + barX.toFixed(2) + '" y="' + segTop.toFixed(2) + '" width="' + barWidth.toFixed(2) + '" height="' + Math.max(segH, 1).toFixed(2) + '" fill="' + color + '" rx="1"/>';
+                    stackBottom = segTop;
+                }
             }
         }
 
