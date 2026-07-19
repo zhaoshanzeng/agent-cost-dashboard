@@ -12,6 +12,8 @@
     --accent-yellow: #d29922;
     --accent-red: #f85149;
     --accent-purple: #a371f7;
+    --bg-card: #161b22;
+    --border: #30363d;
 }
 
 * {
@@ -468,6 +470,80 @@ footer {
     padding: 24px;
     color: var(--text-secondary);
     font-size: 13px;
+}
+
+/* ── 今日实时统计 ── */
+.time-range-selector {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.time-range-btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 6px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s, color 0.2s;
+}
+
+.time-range-btn:hover {
+    background: var(--border);
+    color: var(--text-primary);
+}
+
+.time-range-btn.active {
+    background: var(--accent-green);
+    color: #0d1117;
+    border-color: var(--accent-green);
+    font-weight: 600;
+}
+
+.today-chart-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 8px;
+    overflow-x: auto;
+}
+
+.today-chart-container svg {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+.today-chart-container .muted {
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+.chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.chart-legend .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: default;
+}
+
+.chart-legend .legend-dot {
+    display: inline-block;
+    width: 12px;
+    height: 3px;
+    border-radius: 2px;
+    flex-shrink: 0;
 }
 
 @media (max-width: 700px) {
