@@ -169,6 +169,249 @@ const dashboardData = window.dashboardData || {};
     };
 
     render();
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 今日实时 Token 曲线图
+    // ═══════════════════════════════════════════════════════════════════
+
+    const todayTimeSeries = dashboardData.todayTimeSeries || [];
+    let currentTimeRange = '5m';
+
+    function getBucketSizeMs(range) {
+        return { '5m': 5000, '1h': 60000, '3h': 180000 }[range] || 5000;
+    }
+
+    function getRangeMs(range) {
+        return { '5m': 300000, '1h': 3600000, '3h': 10800000 }[range] || 300000;
+    }
+
+    function switchTimeRange(range) {
+        currentTimeRange = range;
+        document.querySelectorAll('.time-range-btn').forEach(function(btn) {
+            btn.classList.toggle('active', btn.dataset.range === range);
+        });
+        renderTodayChart();
+    }
+
+    function formatTimeLabel(ts, range) {
+        var d = new Date(ts);
+        if (range === '5m') {
+            var h = String(d.getHours()).padStart(2, '0');
+            var m = String(d.getMinutes()).padStart(2, '0');
+            var s = String(d.getSeconds()).padStart(2, '0');
+            return h + ':' + m + ':' + s;
+        }
+        var h = String(d.getHours()).padStart(2, '0');
+        var m = String(d.getMinutes()).padStart(2, '0');
+        return h + ':' + m;
+    }
+
+    function smoothPath(points) {
+        if (points.length < 2) return '';
+        if (points.length === 2) {
+            return 'M' + points[0].x.toFixed(2) + ',' + points[0].y.toFixed(2) + ' L' + points[1].x.toFixed(2) + ',' + points[1].y.toFixed(2);
+        }
+        var d = 'M' + points[0].x.toFixed(2) + ',' + points[0].y.toFixed(2);
+        for (var i = 0; i < points.length - 1; i++) {
+            var p0 = points[Math.max(0, i - 1)];
+            var p1 = points[i];
+            var p2 = points[i + 1];
+            var p3 = points[Math.min(points.length - 1, i + 2)];
+
+            var cp1x = p1.x + (p2.x - p0.x) / 6;
+            var cp1y = p1.y + (p2.y - p0.y) / 6;
+            var cp2x = p2.x - (p3.x - p1.x) / 6;
+            var cp2y = p2.y - (p3.y - p1.y) / 6;
+
+            d += ' C' + cp1x.toFixed(2) + ',' + cp1y.toFixed(2) + ' ' + cp2x.toFixed(2) + ',' + cp2y.toFixed(2) + ' ' + p2.x.toFixed(2) + ',' + p2.y.toFixed(2);
+        }
+        return d;
+    }
+
+    function renderTodayChart() {
+        var container = document.getElementById('today-chart-content');
+        var legendEl = document.getElementById('today-chart-legend');
+        if (!container) return;
+
+        if (!todayTimeSeries.length) {
+            container.innerHTML = '<p class="muted" style="text-align:center;padding:40px 0;">今日暂无 Token 数据</p>';
+            if (legendEl) legendEl.innerHTML = '';
+            return;
+        }
+
+        var range = currentTimeRange;
+        var bucketSizeMs = getBucketSizeMs(range);
+        var rangeMs = getRangeMs(range);
+        var now = Date.now();
+
+        // 1. 按时间范围过滤
+        var filtered = [];
+        for (var i = 0; i < todayTimeSeries.length; i++) {
+            var s = todayTimeSeries[i];
+            var t = new Date(s.ts).getTime();
+            if ((now - t) <= rangeMs && t <= now) {
+                filtered.push(s);
+            }
+        }
+
+        if (!filtered.length) {
+            container.innerHTML = '<p class="muted" style="text-align:center;padding:40px 0;">所选时间范围内暂无 Token 数据</p>';
+            if (legendEl) legendEl.innerHTML = '';
+            return;
+        }
+
+        // 2. 收集所有模型名称（按总 Token 量排序）
+        var modelTotals = {};
+        for (var i = 0; i < filtered.length; i++) {
+            var s = filtered[i];
+            modelTotals[s.model] = (modelTotals[s.model] || 0) + s.tokens;
+        }
+        var models = Object.keys(modelTotals).sort(function(a, b) {
+            return modelTotals[b] - modelTotals[a];
+        });
+
+        // 3. 桶聚合
+        var buckets = {};
+        for (var i = 0; i < filtered.length; i++) {
+            var s = filtered[i];
+            var t = new Date(s.ts).getTime();
+            var bucketKey = Math.floor(t / bucketSizeMs) * bucketSizeMs;
+            if (!buckets[bucketKey]) buckets[bucketKey] = {};
+            buckets[bucketKey][s.model] = (buckets[bucketKey][s.model] || 0) + s.tokens;
+        }
+
+        // 4. 排序桶
+        var bucketKeys = Object.keys(buckets).sort(function(a, b) { return Number(a) - Number(b); });
+        var sortedBuckets = [];
+        for (var i = 0; i < bucketKeys.length; i++) {
+            sortedBuckets.push({
+                ts: Number(bucketKeys[i]),
+                modelTokens: buckets[bucketKeys[i]]
+            });
+        }
+
+        // 5. 计算 Y 轴范围
+        var maxTokens = 1;
+        for (var i = 0; i < sortedBuckets.length; i++) {
+            var b = sortedBuckets[i];
+            var total = 0;
+            for (var j = 0; j < models.length; j++) {
+                total += (b.modelTokens[models[j]] || 0);
+            }
+            if (total > maxTokens) maxTokens = total;
+        }
+
+        // 6. SVG 尺寸
+        var svgW = 800, svgH = 250;
+        var pad = { top: 20, right: 20, bottom: 30, left: 60 };
+        var chartW = svgW - pad.left - pad.right;
+        var chartH = svgH - pad.top - pad.bottom;
+
+        var minTs = sortedBuckets[0].ts;
+        var maxTs = sortedBuckets[sortedBuckets.length - 1].ts;
+        var tsRange = Math.max(maxTs - minTs, 1);
+
+        function xScale(ts) {
+            return pad.left + ((ts - minTs) / tsRange) * chartW;
+        }
+        function yScale(tokens) {
+            return pad.top + chartH - (tokens / maxTokens) * chartH;
+        }
+
+        // 7. 生成 Y 轴刻度
+        var yStep = 1;
+        if (maxTokens <= 5) {
+            yStep = 1;
+        } else if (maxTokens <= 50) {
+            yStep = Math.ceil(maxTokens / 5 / 5) * 5;
+        } else if (maxTokens <= 500) {
+            yStep = Math.ceil(maxTokens / 5 / 10) * 10;
+        } else {
+            yStep = Math.ceil(maxTokens / 5 / 100) * 100;
+        }
+        yStep = Math.max(yStep, 1);
+        var yLabels = [];
+        for (var v = 0; v <= maxTokens; v += yStep) {
+            yLabels.push(v);
+        }
+        if (yLabels[yLabels.length - 1] < maxTokens) {
+            yLabels.push(maxTokens);
+        }
+
+        // 8. 生成 X 轴标签（最多 6 个）
+        var xLabelCount = Math.min(6, sortedBuckets.length);
+        var xStep = Math.max(1, Math.floor(sortedBuckets.length / xLabelCount));
+        var xLabels = [];
+        for (var i = 0; i < sortedBuckets.length; i += xStep) {
+            xLabels.push(sortedBuckets[i].ts);
+        }
+        // 确保最后一个标签
+        if (xLabels.length === 0 || xLabels[xLabels.length - 1] !== sortedBuckets[sortedBuckets.length - 1].ts) {
+            xLabels.push(sortedBuckets[sortedBuckets.length - 1].ts);
+        }
+
+        // 9. 构建 SVG
+        var svg = '<svg class="today-chart-svg" viewBox="0 0 ' + svgW + ' ' + svgH + '" xmlns="http://www.w3.org/2000/svg">';
+
+        // 网格线 + Y 轴标签
+        for (var i = 0; i < yLabels.length; i++) {
+            var v = yLabels[i];
+            var y = yScale(v);
+            svg += '<line x1="' + pad.left + '" y1="' + y.toFixed(2) + '" x2="' + (svgW - pad.right) + '" y2="' + y.toFixed(2) + '" stroke="#30363d" stroke-width="1"/>';
+            var label = v >= 1000 ? (v / 1000).toFixed(1) + 'k' : String(v);
+            svg += '<text x="' + (pad.left - 8) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end" fill="#8b949e" font-size="11">' + label + '</text>';
+        }
+
+        // X 轴标签
+        for (var i = 0; i < xLabels.length; i++) {
+            var x = xScale(xLabels[i]);
+            var label = formatTimeLabel(xLabels[i], range);
+            svg += '<text x="' + x.toFixed(2) + '" y="' + (svgH - 6) + '" text-anchor="middle" fill="#8b949e" font-size="11">' + label + '</text>';
+        }
+
+        // 曲线 — 每个模型一条
+        for (var m = 0; m < models.length; m++) {
+            var model = models[m];
+            var color = modelColor(model, m);
+            var points = [];
+            for (var i = 0; i < sortedBuckets.length; i++) {
+                points.push({
+                    x: xScale(sortedBuckets[i].ts),
+                    y: yScale(sortedBuckets[i].modelTokens[model] || 0)
+                });
+            }
+            var pathD = smoothPath(points);
+            if (pathD) {
+                svg += '<path d="' + pathD + '" stroke="' + color + '" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>';
+            }
+        }
+
+        svg += '</svg>';
+
+        container.innerHTML = svg;
+
+        // 10. 渲染图例
+        if (legendEl) {
+            var legendHtml = '';
+            for (var m = 0; m < models.length; m++) {
+                var model = models[m];
+                var color = modelColor(model, m);
+                var shortName = model.length > 35 ? model.slice(0, 32) + '...' : model;
+                legendHtml += '<span class="legend-item">' +
+                    '<span class="legend-dot" style="background:' + color + '"></span>' +
+                    escapeHtml(shortName) +
+                    '</span>';
+            }
+            legendEl.innerHTML = legendHtml;
+        }
+    }
+
+    // 暴露给 HTML onclick
+    window.switchTimeRange = switchTimeRange;
+    window.renderTodayChart = renderTodayChart;
+
+    // 自动渲染今日图表
+    renderTodayChart();
 })();
 
 const projects = dashboardData.projects || [];
